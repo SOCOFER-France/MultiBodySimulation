@@ -1,5 +1,3 @@
-from msilib.schema import Property
-
 import numpy as np
 from MultiBodySimulation.MBS_numerics import RotationMatrix
 

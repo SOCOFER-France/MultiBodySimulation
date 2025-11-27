@@ -34,10 +34,10 @@ class _MBSLink3D:
         if self.__global_point1.shape != (3,) or self.__global_point2.shape != (3,):
             raise ValueError("Attachment points must be 3D vectors")
 
-        self.__K = np.zeros((3,3))
-        self.__C = np.zeros((3, 3))
-        self.__K_theta = np.zeros((3, 3))
-        self.__C_theta = np.zeros((3, 3))
+        self._K = np.zeros((3,3))
+        self._C = np.zeros((3, 3))
+        self._K_theta = np.zeros((3, 3))
+        self._C_theta = np.zeros((3, 3))
 
         self._init_structural_stiffness(stiffness, damping, angular_stiffness, angular_damping)
 
@@ -85,7 +85,7 @@ class _MBSLink3D:
 
     @property
     def GetLinearReactionMatrices(self):
-        return self.__K, self.__C, self.__K_theta, self.__C_theta
+        return self._K, self._C, self._K_theta, self._C_theta
 
     def _init_structural_stiffness(self, stiffness, damping, angular_stiffness, angular_damping):
 
@@ -93,48 +93,48 @@ class _MBSLink3D:
             stiffness = 0.0
 
         if isinstance(stiffness, (float, int)):
-            self.__K = np.eye(3) * float(stiffness)
+            self._K = np.eye(3) * float(stiffness)
         else:
-            self.__K = np.array(stiffness)
-            if self.__K.shape == (3,):
-                self.__K = np.eye(3) * self.__K
-            elif self.__K.shape != (3, 3):
+            self._K = np.array(stiffness)
+            if self._K.shape == (3,):
+                self._K = np.eye(3) * self._K
+            elif self._K.shape != (3, 3):
                 raise ValueError("Stiffness must be scalar, 3 element array or 3x3 array")
 
         if damping is None:
             damping = 0.0
 
         if isinstance(damping, (float, int)):
-            self.__C = np.eye(3) * float(damping)
+            self._C = np.eye(3) * float(damping)
         else:
-            self.__C = np.array(damping)
-            if self.__C.shape == (3,):
-                self.__C = np.eye(3) * self.__C
-            elif self.__C.shape != (3, 3):
+            self._C = np.array(damping)
+            if self._C.shape == (3,):
+                self._C = np.eye(3) * self._C
+            elif self._C.shape != (3, 3):
                 raise ValueError("Damping must be scalar, 3 element array or 3x3 array")
 
         if angular_stiffness is None:
             angular_stiffness = 0.
 
         if isinstance(angular_stiffness, (float, int)):
-            self.__K_theta = np.eye(3) * float(angular_stiffness)
+            self._K_theta = np.eye(3) * float(angular_stiffness)
         else:
-            self.__K_theta = np.asarray(angular_stiffness)
-            if self.__K_theta.shape == (3,):
-                self.__K_theta = np.eye(3) * self.__K_theta
-            elif self.__K_theta.shape != (3, 3):
+            self._K_theta = np.asarray(angular_stiffness)
+            if self._K_theta.shape == (3,):
+                self._K_theta = np.eye(3) * self._K_theta
+            elif self._K_theta.shape != (3, 3):
                 raise ValueError("Angular stiffness must be scalar, 3 element array or 3x3 array")
 
         if angular_damping is None:
             angular_damping = 0.
 
         if isinstance(angular_damping, (float, int)):
-            self.__C_theta = np.eye(3) * float(angular_damping)
+            self._C_theta = np.eye(3) * float(angular_damping)
         else:
-            self.__C_theta = np.array(angular_damping)
-            if self.__C_theta.shape == (3,):
-                self.__C_theta = np.eye(3) * self.__C_theta
-            elif self.__C_theta.shape != (3, 3):
+            self._C_theta = np.array(angular_damping)
+            if self._C_theta.shape == (3,):
+                self._C_theta = np.eye(3) * self._C_theta
+            elif self._C_theta.shape != (3, 3):
                 raise ValueError("Angular damping must be scalar, 3 element array or 3x3 array")
 
 
@@ -159,15 +159,15 @@ class _MBSLink3D:
         omega_rel = V2[3:] - V1[3:]
 
         # Force de ressort + amortisseur
-        if self.__K is not None or self.__C is not None:
-            force = self.__K @ dp + self.__C @ dv  # Vers body2
+        if self._K is not None or self._C is not None:
+            force = self._K @ dp + self._C @ dv  # Vers body2
         else :
             force = np.zeros(3)
 
         # Couple des liaisons angulaires
-        if self.__K_theta is not None or self.__C_theta is not None:
+        if self._K_theta is not None or self._C_theta is not None:
             # Calcul du moment (torque) de ressort et d'amortissement angulaire
-            torque_rot = self.__K_theta @ angle_axis + self.__C_theta @ omega_rel
+            torque_rot = self._K_theta @ angle_axis + self._C_theta @ omega_rel
         else :
             torque_rot = np.zeros(3)
 
@@ -367,7 +367,7 @@ class MBSLinkKinematic(_MBSLink3D):
 
         # Force de ressort + amortisseur
         if self.K is not None or self.C is not None:
-            force = self.__K @ dp + self.__C @ dv  # Vers body2
+            force = self._K @ dp + self._C @ dv  # Vers body2
         else:
             force = np.zeros(3)
 
@@ -478,6 +478,37 @@ class MBSLinkHardStop(_MBSLink3D) :
         self._TransGap_vector = np.array([Tx_gap, Ty_gap, Tz_gap])
         self._RotGap_vector = np.array([Rx_gap, Ry_gap, Rz_gap])
 
+    def GetLinearLocalReactions(self, U1, V1, U2, V2):
+        dp = U2[:3] - U1[:3]
+        dv = V2[:3] - V1[:3]
+        angle_axis = U2[3:] - U1[3:]
+        omega_rel = V2[3:] - V1[3:]
+
+        du_minus = self._TransGap_vector[:, 0]
+        du_plus = self._TransGap_vector[:, 1]
+        du = np.maximum(0., dp - du_plus) + np.minimum(0., dp - du_minus)
+        dv = dv * (np.abs(du) > 0.)
+
+        dtheta_minus = self._RotGap_vector[:,0]
+        dtheta_plus = self._TransGap_vector[:, 1]
+        dtheta = np.maximum(0., angle_axis - dtheta_plus) + np.minimum(0., angle_axis - dtheta_minus)
+        domega = omega_rel * (np.abs(dtheta)>0.0)
+
+        # Force de ressort + amortisseur
+        if self._K is not None or self._C is not None:
+            force = self._K @ du + self._C @ dv  # Vers body2
+        else:
+            force = np.zeros(3)
+
+        # Couple des liaisons angulaires
+        if self._K_theta is not None or self._C_theta is not None:
+            # Calcul du moment (torque) de ressort et d'amortissement angulaire
+            torque_rot = self._K_theta @ dtheta + self._C_theta @ domega
+        else:
+            torque_rot = np.zeros(3)
+
+        return force, torque_rot
+
 
 
 class MBSLinkSmoothLinearStop(_MBSLink3D) :
@@ -522,7 +553,38 @@ class MBSLinkSmoothLinearStop(_MBSLink3D) :
         self._RotGap_vector = np.array([Rx_gap, Ry_gap, Rz_gap])
 
 
-        self.__K = np.diag([Tx, Ty, Tz]) * self.__K
-        self.__C = np.diag([Tx, Ty, Tz]) * self.__C
-        self.__K_theta = np.diag([Rx, Ry, Rz]) * self.__K_theta
-        self.__C_theta = np.diag([Rx, Ry, Rz]) * self.__C_theta
+        self._K = np.diag([Tx, Ty, Tz]) * self._K
+        self._C = np.diag([Tx, Ty, Tz]) * self._C
+        self._K_theta = np.diag([Rx, Ry, Rz]) * self._K_theta
+        self._C_theta = np.diag([Rx, Ry, Rz]) * self._C_theta
+
+    def GetLinearLocalReactions(self, U1, V1, U2, V2):
+        dp = U2[:3] - U1[:3]
+        dv = V2[:3] - V1[:3]
+        angle_axis = U2[3:] - U1[3:]
+        omega_rel = V2[3:] - V1[3:]
+
+        du_minus = self._TransGap_vector[:, 0]
+        du_plus = self._TransGap_vector[:, 1]
+        du = np.maximum(0., dp - du_plus) + np.minimum(0., dp - du_minus)
+        dv = dv * (np.abs(du) > 0.)
+
+        dtheta_minus = self._RotGap_vector[:,0]
+        dtheta_plus = self._TransGap_vector[:, 1]
+        dtheta = np.maximum(0., angle_axis - dtheta_plus) + np.minimum(0., angle_axis - dtheta_minus)
+        domega = omega_rel * (np.abs(dtheta)>0.0)
+
+        # Force de ressort + amortisseur
+        if self._K is not None or self._C is not None:
+            force = self._K @ du + self._C @ dv  # Vers body2
+        else:
+            force = np.zeros(3)
+
+        # Couple des liaisons angulaires
+        if self._K_theta is not None or self._C_theta is not None:
+            # Calcul du moment (torque) de ressort et d'amortissement angulaire
+            torque_rot = self._K_theta @ dtheta + self._C_theta @ domega
+        else:
+            torque_rot = np.zeros(3)
+
+        return force, torque_rot

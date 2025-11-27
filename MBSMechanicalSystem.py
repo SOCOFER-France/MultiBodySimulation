@@ -336,7 +336,25 @@ class MBSMechanicalSystem3D:
 
 
 
-    def _check_initial_tension(self, U,V):
+    def CheckInitialTensions(self, t0):
+        if not self.__assembled :
+            raise ValueError("Système non assemblé")
+
+        y0_fixed = self._get_ref_state_vector(t0)
+        y0 = self._get_state_vector()  # vecteur déplacement / vitesse (dX, v, dTheta, omega)
+
+        Ufixed = y0_fixed[:6 * self.__nrefbodies]
+        Vfixed = y0_fixed[6 * self.__nrefbodies:]
+
+        Uvec = y0[:6 * self.__nbodies]
+        Vvec = y0[6 * self.__nbodies:]
+
+        U = np.zeros(6 * self.__ntot, dtype=float)
+        V = np.zeros_like(U, dtype=float)
+        U[self.__fixeddof] = Ufixed
+        U[self.__freedof] = Uvec
+        V[self.__fixeddof] = Vfixed
+        V[self.__freedof] = Vvec
 
         init_tension = []
         for (link, si, sj, A1, A2, B1, B2) in self.__non_linear_link + self.__linear_link :
@@ -368,7 +386,7 @@ class MBSMechanicalSystem3D:
         if len(init_tension)>0:
             print("Warning : tension initiale dans des liaisons.")
         for (b1,b2,f) in init_tension :
-            print(b1,">>>",b2," : ", f)
+            print(b1,">>>",b2," : {force | torque}\n", f)
 
     def _non_linear_forces(self,y, yfixed):
         U = np.zeros(6 * self.__ntot, dtype=float)
@@ -412,9 +430,15 @@ class MBSMechanicalSystem3D:
         self.__assembled = True
 
 
-    def RunDynamicSimulation(self, t_span, dt, ode_method="BDF", print_step_rate=0):
+    def RunDynamicSimulation(self, t_span, dt, ode_method="BDF", print_step_rate=0,
+                             smallAngles = True , smallAnglesDegreesThreshold=5.0):
         if not self.__assembled :
             self.AssemblyMatrixSystem()
+
+        if not smallAngles :
+            smallAnglesThreshold = smallAnglesDegreesThreshold / 180 * np.pi
+        else :
+            smallAnglesThreshold = None
 
         nt = int( np.ceil( (t_span[1] - t_span[0]) / dt ) + 1 )
         t_eval = np.linspace(t_span[0], t_span[1], nt)
@@ -424,7 +448,10 @@ class MBSMechanicalSystem3D:
 
 
         if ode_method in ["BDF", "Radau"] :
-            y, yfixed, Dy, Dyfixed = self._RunSolveIVP(t_eval, print_step_rate)
+            y, yfixed, Dy, Dyfixed = self._RunSolveIVP(t_eval,
+                                                       print_step_rate,
+                                                       method = ode_method,
+                                                       smallAnglesThreshold = smallAnglesThreshold)
 
         result_dict = {}
 
@@ -452,6 +479,77 @@ class MBSMechanicalSystem3D:
         return t_eval, result_dict
 
 
+
+    def _RunSolveIVP(self, t_eval,
+                     print_step_rate : int =0,
+                     method : str = "BDF",
+                     smallAnglesThreshold = None):
+        if not isinstance(print_step_rate, int) :
+            raise TypeError("'print_step_rate' must be integer. 0 to disable printing.")
+
+
+        nt = len(t_eval)
+        t0, Dy0 = self.__initialState(t_eval)
+
+        if print_step_rate <= 1 :
+            substep = 1
+            steps = np.array([0,nt],dtype=int)
+        else :
+            steps = np.unique([int(s) for s in np.linspace(0,nt,print_step_rate)])
+            substep = len(steps) - 1
+
+        Dy = np.zeros((self.__nbodies * 12, nt))
+        Dyfixed = np.zeros((self.__nrefbodies * 12, nt))
+
+        # Notes :
+        # Dy << vecteur état des corps libres 12 composantes
+        # Dx déplacement / déformation translation
+        # Dtheta déformation angulaire
+        # Vx vitesse en translation
+        # omega vitesse angulaire
+
+
+        if self.__n_gapLink == 0 :
+            jac = self._approxJacobian()
+        else :
+            jac = self._approxJacobian
+
+
+        for k, (start, end) in enumerate(zip(steps[:-1],steps[1:]),start=1) :
+            t_substep = t_eval[start:end:]
+            t_span = (t_substep[0], t_substep[-1])
+
+
+            sol = solve_ivp(self.__IVP_derivativeFunc,
+                            t_span,
+                            Dy0,
+                            method=method,
+                            t_eval=t_substep,
+                            jac=jac)
+
+            Dyfixed[:,start:end-1:] = np.array([self._get_ref_state_vector(ti) for ti in t_substep[:-1]]).T
+            Dy[:, start:end-1:] = sol.y[:,:-1]
+
+            Dy0 = sol.y[:,-1]
+            if k == substep :
+                # Dernière itération
+                Dy[:, -1] = Dy0
+                Dyfixed[:, -1] = self._get_ref_state_vector(t_substep[-1])
+
+            print("Step X / N ... blablabla")
+
+        y = self._recompose_body_position(Dy)
+        yfixed = self._recompose_ref_body_position(Dyfixed)
+
+        # Notes :
+        # y << vecteur position corps libres 12 composantes
+        # x position
+        # theta angle d'euler
+        # Vx vitesse
+        # omega vitesse angulaire
+        return y, yfixed, Dy, Dyfixed
+
+
     def __initialState(self,t_eval):
         t0 = t_eval[0]
         y0_fixed = self._get_ref_state_vector(t0)
@@ -471,8 +569,6 @@ class MBSMechanicalSystem3D:
         V[self.__fixeddof] = Vfixed
         V[self.__freedof] = Vvec
 
-
-        self._check_initial_tension(U, V)
         return t0, y0
 
     def _nonLinearForces(self, y, yfixed):
@@ -553,7 +649,6 @@ class MBSMechanicalSystem3D:
             A[n:, :n] = -self.__invMff @ self.__Kff
             A[n:, n:] = -self.__invMff @ self.__Cff
             self.__Jac_linear = csc_matrix(A)
-        return self.__Jac_linear
 
         if self.__n_gapLink == 0 :
             return self.__Jac_linear
@@ -561,7 +656,10 @@ class MBSMechanicalSystem3D:
         n = 6 * self.__nbodies
         u = y[:n]
 
-        du = self.__Qgap_f @ u
+        yref = self._get_ref_state_vector(t)
+        ub = yref[:6 * self.__nrefbodies]
+
+        du = -(self.__Qgap_f @ u + self.__Qgap_b @ ub)
 
         phi0 = np.maximum(0, du - self.__gapPlus) + np.minimum(0, du - self.__gapMinus)
         s_phi = 1.0 * (phi0 > 0) + 1.0 * (phi0 < 0)
@@ -574,70 +672,3 @@ class MBSMechanicalSystem3D:
         return Agap_penal + self.__Jac_linear
 
 
-    def _RunSolveIVP(self, t_eval,
-                     print_step_rate : int =0,
-                     method : str = "BDF"):
-        if not isinstance(print_step_rate, int) :
-            raise TypeError("'print_step_rate' must be integer. 0 to disable printing.")
-
-
-        nt = len(t_eval)
-        t0, Dy0 = self.__initialState(t_eval)
-
-        if print_step_rate <= 1 :
-            substep = 1
-            steps = np.array([0,nt],dtype=int)
-        else :
-            steps = np.unique([int(s) for s in np.linspace(0,nt,print_step_rate)])
-            substep = len(steps) - 1
-
-        Dy = np.zeros((self.__nbodies * 12, nt))
-        Dyfixed = np.zeros((self.__nrefbodies * 12, nt))
-
-        # Notes :
-        # Dy << vecteur état des corps libres 12 composantes
-        # Dx déplacement / déformation translation
-        # Dtheta déformation angulaire
-        # Vx vitesse en translation
-        # omega vitesse angulaire
-
-
-        if self.__n_gapLink == 0 :
-            jac = self._approxJacobian()
-        else :
-            jac = self._approxJacobian
-
-
-        for k, (start, end) in enumerate(zip(steps[:-1],steps[1:]),start=1) :
-            t_substep = t_eval[start:end:]
-            t_span = (t_substep[0], t_substep[-1])
-
-
-            sol = solve_ivp(self.__IVP_derivativeFunc,
-                            t_span,
-                            Dy0,
-                            method=method,
-                            t_eval=t_substep,
-                            )#jac=jac)
-
-            Dyfixed[:,start:end-1:] = np.array([self._get_ref_state_vector(ti) for ti in t_substep[:-1]]).T
-            Dy[:, start:end-1:] = sol.y[:,:-1]
-
-            Dy0 = sol.y[:,-1]
-            if k == substep :
-                # Dernière itération
-                Dy[:, -1] = Dy0
-                Dyfixed[:, -1] = self._get_ref_state_vector(t_substep[-1])
-
-            print("Step X / N ... blablabla")
-
-        y = self._recompose_body_position(Dy)
-        yfixed = self._recompose_ref_body_position(Dyfixed)
-
-        # Notes :
-        # y << vecteur position corps libres 12 composantes
-        # x position
-        # theta angle d'euler
-        # Vx vitesse
-        # omega vitesse angulaire
-        return y, yfixed, Dy, Dyfixed
