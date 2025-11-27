@@ -214,22 +214,6 @@ class MBSReferenceBody3D(MBSRigidBody3D) :
             self._omegaZ_func(t)
         ])
 
-    def _updateMotion(self, t):
-        self._position = np.array([self.__dX_func(t),
-                                  self.__dY_func(t),
-                                  self.__dZ_func(t)]) + self._initial_position
-
-        self._velocity = np.array([self.__VX_func(t),
-                                  self.__VY_func(t),
-                                  self.__VZ_func(t)])
-
-        self._theta = np.array([self.__dthetaX_func(t) ,
-                               self.__dthetaY_func(t) ,
-                               self.__dthetaZ_func(t) ]) + self._initial_angles
-
-        self._omega = np.array([self._omegaX_func(t),
-                               self._omegaY_func(t),
-                               self._omegaZ_func(t)])
 
 
 

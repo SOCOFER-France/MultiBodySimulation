@@ -125,7 +125,7 @@ class MBSMechanicalSystem3D:
         self.links.append(link)
 
 
-    def _get_ref_state_vector(self, t):
+    def _get_refbodies_displacement_state(self, t):
         y = []
         dydt = []
         for body in self.ref_bodies :
@@ -135,7 +135,7 @@ class MBSMechanicalSystem3D:
             dydt.append(Dy[6:])
         return np.concatenate(y + dydt)
 
-    def _get_state_vector(self):
+    def _get_bodies_initial_displacement(self):
         y = []
         dydt = []
         for body in self.bodies :
@@ -357,8 +357,8 @@ class MBSMechanicalSystem3D:
         if not self.__assembled :
             raise ValueError("Système non assemblé")
 
-        y0_fixed = self._get_ref_state_vector(t0)
-        y0 = self._get_state_vector()  # vecteur déplacement / vitesse (dX, v, dTheta, omega)
+        y0_fixed = self._get_refbodies_displacement_state(t0)
+        y0 = self._get_bodies_initial_displacement()  # vecteur déplacement / vitesse (dX, v, dTheta, omega)
 
         Ufixed = y0_fixed[:6 * self.__nrefbodies]
         Vfixed = y0_fixed[6 * self.__nrefbodies:]
@@ -519,11 +519,18 @@ class MBSMechanicalSystem3D:
         Dyfixed = np.zeros((self.__nrefbodies * 12, nt))
 
         # Notes :
-        # Dy << vecteur état des corps libres 12 composantes
+        # Dy << vecteur état déplacements des corps libres 12 composantes
         # Dx déplacement / déformation translation
         # Dtheta déformation angulaire
         # Vx vitesse en translation
         # omega vitesse angulaire
+        # structure Dy = { [Dx, Dtheta]_0,
+        #                  [Dx, Dtheta]_1,
+        #                   ...
+        #                  [Dx, Dtheta]_n,
+        #                  [Vx, omega]_0,
+        #                   ...
+        #                  [Vx, omega]_n,}
 
 
         if self.__n_gapLink == 0 :
@@ -531,15 +538,10 @@ class MBSMechanicalSystem3D:
         else :
             jac = self._approxJacobian
 
-        # event = lambda t,y : self._check_largeAngles(t,y,angleTreshold= smallAnglesThreshold)
-        # event.terminal = True
-
 
         for k, (start_substep, end_substep) in enumerate(zip(steps[:-1],steps[1:]),start=1) :
             t_substep = t_eval[start_substep:end_substep:]
             t_span = (t_substep[0], t_substep[-1])
-
-
 
             sol = solve_ivp(self.__IVP_derivativeFunc,
                             t_span,
@@ -549,14 +551,14 @@ class MBSMechanicalSystem3D:
                             jac=jac,
                             )
 
-            Dyfixed[:,start_substep:end_substep-1:] = np.array([self._get_ref_state_vector(ti) for ti in t_substep[:-1]]).T
+            Dyfixed[:,start_substep:end_substep-1:] = np.array([self._get_refbodies_displacement_state(ti) for ti in t_substep[:-1]]).T
             Dy[:, start_substep:end_substep-1:] = sol.y[:,:-1]
 
             Dy0 = sol.y[:,-1]
             if k == substep :
                 # Dernière itération
                 Dy[:, -1] = Dy0
-                Dyfixed[:, -1] = self._get_ref_state_vector(t_substep[-1])
+                Dyfixed[:, -1] = self._get_refbodies_displacement_state(t_substep[-1])
 
             print("Step X / N ... blablabla")
 
@@ -574,8 +576,8 @@ class MBSMechanicalSystem3D:
 
     def __initialState(self,t_eval):
         t0 = t_eval[0]
-        y0_fixed = self._get_ref_state_vector(t0)
-        y0 = self._get_state_vector() # vecteur déplacement / vitesse (dX, v, dTheta, omega)
+        y0_fixed = self._get_refbodies_displacement_state(t0)
+        y0 = self._get_bodies_initial_displacement() # vecteur déplacement / vitesse (dX, v, dTheta, omega)
 
 
         Ufixed = y0_fixed[:6 * self.__nrefbodies]
@@ -645,7 +647,7 @@ class MBSMechanicalSystem3D:
         return F
 
     def __IVP_derivativeFunc(self, t, y):
-        yfixed = self._get_ref_state_vector(t)
+        yfixed = self._get_refbodies_displacement_state(t)
         Ufixed = yfixed[:6 * self.__nrefbodies]
         Vfixed = yfixed[6 * self.__nrefbodies:]
 
@@ -678,7 +680,7 @@ class MBSMechanicalSystem3D:
         n = 6 * self.__nbodies
         u = y[:n]
 
-        yref = self._get_ref_state_vector(t)
+        yref = self._get_refbodies_displacement_state(t)
         ub = yref[:6 * self.__nrefbodies]
 
         du = -(self.__Qgap_f @ u + self.__Qgap_b @ ub)
@@ -694,15 +696,3 @@ class MBSMechanicalSystem3D:
         return Agap_penal + self.__Jac_linear
 
 
-    def _check_largeAngles(self, t, y, angleTreshold : float =None):
-        if angleTreshold is None : return 1.0
-        yfixed = self._get_ref_state_vector(t)
-        max_angle = max(
-            np.max( np.abs(y[self.__theta_indices]) ),
-            np.max( np.abs(yfixed[self.__thetaref_indices]) )
-        )
-        print(max_angle)
-        if t >25.0 : return 0.
-        # Si max_angle > angleTreshold return 0.
-        # Active l'event
-        return (max_angle < angleTreshold) * 1.0
