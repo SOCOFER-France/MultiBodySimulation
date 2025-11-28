@@ -27,7 +27,7 @@ class MBSRigidBody3D:
 
 
         self._referencePosition = np.zeros(3, dtype=float)
-        self._angles = np.zeros(3, dtype=float)
+        self._refAngles = np.zeros(3, dtype=float)
         self._initial_position = np.zeros(3, dtype=float)
         self._initial_angles = np.zeros(3, dtype=float)
         self._velocity = np.zeros(3, dtype=float)
@@ -52,7 +52,7 @@ class MBSRigidBody3D:
         return self._referencePosition
 
     def GetReferenceAngle(self):
-        return self._angles
+        return self._refAngles
 
     def SetReferencePosition(self, position : np.ndarray):
         """
@@ -73,7 +73,7 @@ class MBSRigidBody3D:
         if angle.shape != (3,):
             raise ValueError("Angle vector must be shape (3,)")
 
-        self._angles = angle.copy()
+        self._refAngles = angle.copy()
         self._initial_angles = angle.copy()
 
     def ChangeInitialPosition(self, position : np.ndarray):
@@ -107,7 +107,7 @@ class MBSRigidBody3D:
         global_point = np.asarray(global_point)
         if global_point.shape != (3,):
             raise ValueError("global_point must be a 3D vector of shape (3,)")
-        R = RotationMatrix(*self._angles)
+        R = RotationMatrix(*self._refAngles)
         return np.linalg.solve(R, global_point - self._referencePosition)
 
     def GetBodyGlobalCoords(self, local_point):
@@ -119,7 +119,7 @@ class MBSRigidBody3D:
         local_point = np.asarray(local_point)
         if local_point.shape != (3,):
             raise ValueError("local_point must be a 3D vector of shape (3,)")
-        R = RotationMatrix(*self._angles)
+        R = RotationMatrix(*self._refAngles)
 
         return self._referencePosition + R @ local_point
 
@@ -132,7 +132,7 @@ class MBSRigidBody3D:
         local_vector = np.array(local_vector)
         if local_vector.shape != (3,):
             raise ValueError("local_vector must be a 3D vector of shape (3,)")
-        R = RotationMatrix(*self._angles)
+        R = RotationMatrix(*self._refAngles)
         return R @ local_vector
 
 class MBSReferenceBody3D(MBSRigidBody3D) :

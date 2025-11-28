@@ -140,23 +140,43 @@ class MBSMechanicalSystem3D:
         dydt = []
         for body in self.bodies :
             y.append(body._initial_position - body._referencePosition)
-            y.append(body._initial_angles - body._angles)
+            y.append(body._initial_angles - body._refAngles)
             dydt.append(body._velocity)
             dydt.append(body._omega)
         return np.concatenate(y + dydt)
 
+    def _get_refbodies_position_state(self, t):
+        y = []
+        dydt = []
+        for body in self.ref_bodies:
+            Dy = body._updateDisplacement(t)
+            Dy[:3] += body._referencePosition
+            Dy[3:6:] += body._refAngles
+            y.append(Dy[:6])
+            dydt.append(Dy[6:])
+        return np.concatenate(y + dydt)
+
+    def _get_bodies_reference_position(self):
+        y = []
+        dydt = []
+        for body in self.bodies :
+            y.append(body._referencePosition)
+            y.append(body._refAngles)
+            dydt.append([0.] * 12)
+        return np.concatenate(y + dydt)
+
     def _recompose_ref_body_position(self, Dy):
-        y = Dy[:]
+        y = Dy.copy()
         for i, body in enumerate(self.ref_bodies):
             y[6 * i:6 * i + 3] = body._referencePosition[:, None] + Dy[6 * i:6 * i + 3]
-            y[6 * i + 3:6 * i + 6] = body._angles[:, None] + Dy[6 * i + 3:6 * i + 6]
+            y[6 * i + 3:6 * i + 6] = body._refAngles[:, None] + Dy[6 * i + 3:6 * i + 6]
         return y
 
     def _recompose_body_position(self, Dy):
-        y = Dy[:]
+        y = Dy.copy()
         for i, body in enumerate(self.bodies):
             y[6 * i:6 * i + 3] = body._referencePosition[:, None] + Dy[6 * i:6 * i + 3]
-            y[6 * i + 3:6 * i + 6] = body._angles[:, None] + Dy[6 * i + 3:6 * i + 6]
+            y[6 * i + 3:6 * i + 6] = body._refAngles[:, None] + Dy[6 * i + 3:6 * i + 6]
         return y
 
 
@@ -169,6 +189,12 @@ class MBSMechanicalSystem3D:
         self.__Cmatrix = np.zeros((6*nbodies, 6*nbodies), dtype=float)
         # matrice de masse
         self.__Mmatrix = np.zeros((6*nbodies, 6*nbodies), dtype=float)
+        # Matrice Q et P
+        nlinks = len(self.links)
+        self.__Qmat_linkage = np.zeros((6 * nlinks, 6 * nbodies))
+        self.__Pmat_linkage = np.zeros((6 * nbodies, 6 * nlinks))
+        self.__Kmat_linkage = np.zeros((6 * nlinks, 6 * nlinks))
+        self.__Cmat_linkage = np.zeros((6 * nlinks, 6 * nlinks))
 
         self.__nbodies = len(self.bodies)
         self.__nrefbodies = len(self.ref_bodies)
@@ -215,7 +241,7 @@ class MBSMechanicalSystem3D:
         id_gap = 0
 
 
-        for link in self.links :
+        for id_link, link in enumerate(self.links) :
 
             b1 = link.GetBody1
             b2 = link.GetBody2
@@ -270,8 +296,8 @@ class MBSMechanicalSystem3D:
                 Qcons[s_cons, si] = B1
                 Qcons[s_cons, sj] = -B2
 
-                Pcons[si, s_cons] = -A1
-                Pcons[sj, s_cons] = A2  # Avec A1 + et A2 - ==> P @ K @ Q === Kmat
+                Pcons[si, s_cons] = A1
+                Pcons[sj, s_cons] = -A2  # Avec A1 + et A2 - ==> P @ K @ Q === Kmat
 
                 Kcons[s_cons, s_cons] = Kloc
                 Ccons[s_cons, s_cons] = Cloc
@@ -281,11 +307,11 @@ class MBSMechanicalSystem3D:
                 s_gap = slice(id_gap * 6, id_gap*6 + 6)
                 s_gap_trans = slice(id_gap * 6, id_gap*6 + 3)
                 s_gap_rot = slice(id_gap * 6 + 3, id_gap * 6 + 6)
-                Qgap[s_gap, si] = B1
-                Qgap[s_gap, sj] = -B2
+                Qgap[s_gap, si] = -B1
+                Qgap[s_gap, sj] = B2
 
                 Pgap[si, s_gap] = -A1
-                Pgap[sj, s_gap] = A2  # Avec A1 + et A2 - ==> P @ K @ Q === Kmat
+                Pgap[sj, s_gap] = A2  # Avec A1/B1 - et A2/B2 + ==> P @ K @ Q === Kmat
 
                 Kgap[s_gap, s_gap] = Kloc
                 Cgap[s_gap, s_gap] = Cloc
@@ -299,29 +325,43 @@ class MBSMechanicalSystem3D:
 
                 continue
 
+            s_linkage = slice(id_link * 6, id_link * 6 + 6)
+            # Avec A1/B1 - et A2/B2 + ==> P @ K @ Q === Kmat
+            self.__Qmat_linkage[s_linkage][:, si] += -B1
+            self.__Qmat_linkage[s_linkage][:, sj] += B2
+
+            self.__Pmat_linkage[si][:, s_linkage] += -A1
+            self.__Pmat_linkage[sj][:, s_linkage] += A2
+
+            self.__Kmat_linkage[s_linkage][:, s_linkage] += Kloc
+            self.__Cmat_linkage[s_linkage][:, s_linkage] += Cloc
+
             # contribution aux matrices globales : T_i^T * Kloc * T_i, etc.
 
-            K11 = A1.dot(Kloc).dot(B1)
-            K12 = -A1.dot(Kloc).dot(B2)
-            K22 = A2.dot(Kloc).dot(B2)
-            K21 = -A2.dot(Kloc).dot(B1)
+            # K11 = A1.dot(Kloc).dot(B1)
+            # K12 = -A1.dot(Kloc).dot(B2)
+            # K22 = A2.dot(Kloc).dot(B2)
+            # K21 = -A2.dot(Kloc).dot(B1)
+            #
+            # C11 = A1.dot(Cloc).dot(B1)
+            # C12 = -A1.dot(Cloc).dot(B2)
+            # C22 = A2.dot(Cloc).dot(B2)
+            # C21 = -A2.dot(Cloc).dot(B1)
+            #
+            #
+            # # assemble in global matrices
+            # self.__Kmatrix[si][:, si] += K11
+            # self.__Kmatrix[sj][:, sj] += K22
+            # self.__Kmatrix[si][:, sj] += K12
+            # self.__Kmatrix[sj][:, si] += K21
+            #
+            # self.__Cmatrix[si][:, si] += C11
+            # self.__Cmatrix[sj][:, sj] += C22
+            # self.__Cmatrix[si][:, sj] += C12
+            # self.__Cmatrix[sj][:, si] += C21
 
-            C11 = A1.dot(Cloc).dot(B1)
-            C12 = -A1.dot(Cloc).dot(B2)
-            C22 = A2.dot(Cloc).dot(B2)
-            C21 = -A2.dot(Cloc).dot(B1)
 
 
-            # assemble in global matrices
-            self.__Kmatrix[si][:, si] += K11
-            self.__Kmatrix[sj][:, sj] += K22
-            self.__Kmatrix[si][:, sj] += K12
-            self.__Kmatrix[sj][:, si] += K21
-
-            self.__Cmatrix[si][:, si] += C11
-            self.__Cmatrix[sj][:, sj] += C22
-            self.__Cmatrix[si][:, sj] += C12
-            self.__Cmatrix[sj][:, si] += C21
 
         keepgap = (~np.isinf(stop_delta_plus)) & (~np.isinf(stop_delta_minus))
         self.__Pmat_gap = Pgap[:, keepgap]
@@ -331,6 +371,9 @@ class MBSMechanicalSystem3D:
         self.__gapPlus = stop_delta_plus[keepgap]
         self.__gapMinus = stop_delta_minus[keepgap]
 
+
+        self.__Kmatrix = self.__Pmat_linkage @ self.__Kmat_linkage @ self.__Qmat_linkage
+        self.__Cmatrix = self.__Pmat_linkage @ self.__Cmat_linkage @ self.__Qmat_linkage
 
     def _partition_matrices(self):
         """Partitionne M,C,K et F en sous-systèmes libres/prescrits :
@@ -507,6 +550,19 @@ class MBSMechanicalSystem3D:
 
         nt = len(t_eval)
         t0, Dy0 = self.__initialState(t_eval)
+        y0 = self._get_bodies_reference_position()
+        yfixed0 = self._get_refbodies_position_state(0)
+        U = np.zeros(self.__ntot*6)
+        U[self.__freedof] = y0[:self.__nbodies*6]
+        U[self.__fixeddof] = yfixed0[:self.__nrefbodies * 6]
+        du0 = self.__Qmat_linkage @ U
+        print(du0)
+        Du = np.zeros_like(U)
+        Dyfixed0 = self._get_refbodies_displacement_state(0)
+        Du[self.__freedof] = Dy0[:self.__nbodies * 6]
+        Du[self.__fixeddof] = Dyfixed0[:self.__nrefbodies * 6]
+        du0 = self.__Qmat_linkage @ Du
+        print(du0)
 
         if print_step_rate <= 1 :
             substep = 1
@@ -636,8 +692,8 @@ class MBSMechanicalSystem3D:
         v = y[6 * self.__nbodies:]
 
 
-        du = -(self.__Qgap_f @ u + self.__Qgap_b @ ub)
-        dv = -(self.__Qgap_f @ v + self.__Qgap_b @ vb)
+        du = (self.__Qgap_f @ u + self.__Qgap_b @ ub)
+        dv = (self.__Qgap_f @ v + self.__Qgap_b @ vb)
         du_viol = np.maximum(0., du - self.__gapPlus) +\
                   np.minimum(0., du - self.__gapMinus)
         dv_viol = dv * (np.abs(du_viol) > 0.)
@@ -683,15 +739,15 @@ class MBSMechanicalSystem3D:
         yref = self._get_refbodies_displacement_state(t)
         ub = yref[:6 * self.__nrefbodies]
 
-        du = -(self.__Qgap_f @ u + self.__Qgap_b @ ub)
+        du = (self.__Qgap_f @ u + self.__Qgap_b @ ub)
 
         phi0 = np.maximum(0, du - self.__gapPlus) + np.minimum(0, du - self.__gapMinus)
         s_phi = 1.0 * (phi0 > 0) + 1.0 * (phi0 < 0)
         Pf = (self.__Pgap_f * s_phi[np.newaxis])
 
         Agap_penal = np.zeros((2 * n, 2 * n))
-        Agap_penal[n:, :n] = self.__invMff @ (Pf @ ((self.__Kmat_gap @ self.__Qgap_f)))
-        Agap_penal[n:, n:] = self.__invMff @ (Pf @ ((self.__Cmat_gap @ self.__Qgap_f)))
+        Agap_penal[n:, :n] = -self.__invMff @ (Pf @ ((self.__Kmat_gap @ self.__Qgap_f)))
+        Agap_penal[n:, n:] = -self.__invMff @ (Pf @ ((self.__Cmat_gap @ self.__Qgap_f)))
         Agap_penal = csc_matrix(Agap_penal)
         return Agap_penal + self.__Jac_linear
 
