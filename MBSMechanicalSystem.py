@@ -48,6 +48,11 @@ class MBSMechanicalSystem3D:
 
         self.__Jac_linear = None
 
+        self.__dUreference = None
+        self.__Freference = None
+        self.__yref = None
+        self.__yref_fixed = None
+
     @property
     def __allbodies(self):
         return self.ref_bodies + self.bodies
@@ -162,7 +167,7 @@ class MBSMechanicalSystem3D:
         for body in self.bodies :
             y.append(body._referencePosition)
             y.append(body._refAngles)
-            dydt.append([0.] * 12)
+            dydt.append([0.] * 6)
         return np.concatenate(y + dydt)
 
     def _recompose_ref_body_position(self, Dy):
@@ -190,11 +195,11 @@ class MBSMechanicalSystem3D:
         # matrice de masse
         self.__Mmatrix = np.zeros((6*nbodies, 6*nbodies), dtype=float)
         # Matrice Q et P
-        nlinks = len(self.links)
-        self.__Qmat_linkage = np.zeros((6 * nlinks, 6 * nbodies))
-        self.__Pmat_linkage = np.zeros((6 * nbodies, 6 * nlinks))
-        self.__Kmat_linkage = np.zeros((6 * nlinks, 6 * nlinks))
-        self.__Cmat_linkage = np.zeros((6 * nlinks, 6 * nlinks))
+        self.__nlinks = len(self.links)
+        self.__Qmat_linkage = np.zeros((6 * self.__nlinks, 6 * nbodies))
+        self.__Pmat_linkage = np.zeros((6 * nbodies, 6 * self.__nlinks))
+        self.__Kmat_linkage = np.zeros((6 * self.__nlinks, 6 * self.__nlinks))
+        self.__Cmat_linkage = np.zeros((6 * self.__nlinks, 6 * self.__nlinks))
 
         self.__nbodies = len(self.bodies)
         self.__nrefbodies = len(self.ref_bodies)
@@ -238,6 +243,7 @@ class MBSMechanicalSystem3D:
         Qgap = np.zeros((ngap * 6, 6 * nbodies))
         Kgap = np.zeros((ngap * 6, ngap * 6))
         Cgap = np.zeros((ngap * 6, ngap * 6))
+        gap_indices = np.zeros(ngap * 6, dtype=int)
         id_gap = 0
 
 
@@ -274,7 +280,7 @@ class MBSMechanicalSystem3D:
             Kt,Ct, Kth,Cth = link.GetLinearReactionMatrices
 
             # linéaire / non-linéaire
-            link_prop = (link, si, sj, A1,A2, B1,B2)
+            link_prop = (link, id_link, si, sj, A1,A2, B1,B2)
             if link.IsLinear :
                 self.__linear_link.append(link_prop)
             else :
@@ -293,11 +299,11 @@ class MBSMechanicalSystem3D:
 
             if link.IsKinematic :
                 s_cons = slice(id_constraint * 6, id_constraint * 6 + 6)
-                Qcons[s_cons, si] = B1
-                Qcons[s_cons, sj] = -B2
+                Qcons[s_cons, si] = -B1
+                Qcons[s_cons, sj] = B2
 
-                Pcons[si, s_cons] = A1
-                Pcons[sj, s_cons] = -A2  # Avec A1 + et A2 - ==> P @ K @ Q === Kmat
+                Pcons[si, s_cons] = -A1
+                Pcons[sj, s_cons] = A2  # Avec A1/B1 - et A2/B2 + ==> P @ K @ Q === Kmat
 
                 Kcons[s_cons, s_cons] = Kloc
                 Ccons[s_cons, s_cons] = Cloc
@@ -313,9 +319,10 @@ class MBSMechanicalSystem3D:
                 Pgap[si, s_gap] = -A1
                 Pgap[sj, s_gap] = A2  # Avec A1/B1 - et A2/B2 + ==> P @ K @ Q === Kmat
 
-                Kgap[s_gap, s_gap] = Kloc
-                Cgap[s_gap, s_gap] = Cloc
+                Kgap[s_gap, s_gap] += Kloc
+                Cgap[s_gap, s_gap] += Cloc
 
+                gap_indices[s_gap] =  list(range( 6*id_link, 6*id_link + 6 ))
 
 
                 stop_delta_plus[s_gap_trans] = link.GetTransGap[:,1]
@@ -323,7 +330,9 @@ class MBSMechanicalSystem3D:
                 stop_delta_minus[s_gap_trans] = link.GetTransGap[:, 0]
                 stop_delta_minus[s_gap_rot] = link.GetRotGap[:, 0]
 
-                continue
+                Kloc = 0.
+                Cloc = 0.
+
 
             s_linkage = slice(id_link * 6, id_link * 6 + 6)
             # Avec A1/B1 - et A2/B2 + ==> P @ K @ Q === Kmat
@@ -370,7 +379,7 @@ class MBSMechanicalSystem3D:
         self.__Cmat_gap = Cgap[keepgap][:, keepgap]
         self.__gapPlus = stop_delta_plus[keepgap]
         self.__gapMinus = stop_delta_minus[keepgap]
-
+        self.__local_gap_index = gap_indices[keepgap]
 
         self.__Kmatrix = self.__Pmat_linkage @ self.__Kmat_linkage @ self.__Qmat_linkage
         self.__Cmatrix = self.__Pmat_linkage @ self.__Cmat_linkage @ self.__Qmat_linkage
@@ -550,19 +559,7 @@ class MBSMechanicalSystem3D:
 
         nt = len(t_eval)
         t0, Dy0 = self.__initialState(t_eval)
-        y0 = self._get_bodies_reference_position()
-        yfixed0 = self._get_refbodies_position_state(0)
-        U = np.zeros(self.__ntot*6)
-        U[self.__freedof] = y0[:self.__nbodies*6]
-        U[self.__fixeddof] = yfixed0[:self.__nrefbodies * 6]
-        du0 = self.__Qmat_linkage @ U
-        print(du0)
-        Du = np.zeros_like(U)
-        Dyfixed0 = self._get_refbodies_displacement_state(0)
-        Du[self.__freedof] = Dy0[:self.__nbodies * 6]
-        Du[self.__fixeddof] = Dyfixed0[:self.__nrefbodies * 6]
-        du0 = self.__Qmat_linkage @ Du
-        print(du0)
+
 
         if print_step_rate <= 1 :
             substep = 1
@@ -632,67 +629,81 @@ class MBSMechanicalSystem3D:
 
     def __initialState(self,t_eval):
         t0 = t_eval[0]
-        y0_fixed = self._get_refbodies_displacement_state(t0)
-        y0 = self._get_bodies_initial_displacement() # vecteur déplacement / vitesse (dX, v, dTheta, omega)
+        # Dy0_fixed = self._get_refbodies_displacement_state(t0)
 
 
-        Ufixed = y0_fixed[:6 * self.__nrefbodies]
-        Vfixed = y0_fixed[6 * self.__nrefbodies:]
 
-        Uvec = y0[:6 * self.__nbodies]
-        Vvec = y0[6 * self.__nbodies:]
+        ndof_free = 6 * self.__nbodies
+        ndof_fixed = 6 * self.__nrefbodies
 
-        U = np.zeros(6 * self.__ntot, dtype=float)
-        V = np.zeros_like(U, dtype=float)
-        U[self.__fixeddof] = Ufixed
-        U[self.__freedof] = Uvec
-        V[self.__fixeddof] = Vfixed
-        V[self.__freedof] = Vvec
+        yref = self._get_bodies_reference_position()
+        yref_fixed = self._get_refbodies_position_state(0)
+        Dy0 = self._get_bodies_initial_displacement()  # vecteur déplacement / vitesse (dX, v, dTheta, omega)
 
-        return t0, y0
+        Uref = np.zeros(6*self.__ntot)
+        Uref[self.__freedof] = yref[:ndof_free]
+        Uref[self.__fixeddof] = yref_fixed[:ndof_fixed]
 
-    def _nonLinearForces(self, y, yfixed):
-        U = np.zeros(6 * self.__ntot, dtype=float)
-        V = np.zeros_like(U, dtype=float)
 
-        U[self.__fixeddof] = yfixed[:6 * self.__nrefbodies]
-        V[self.__fixeddof] = yfixed[6 * self.__nrefbodies:]
-        U[self.__freedof] = y[:6 * self.__nbodies]
-        V[self.__freedof] = y[6 * self.__nbodies:]
+        self.__dUreference = self.__Qmat_linkage @ Uref
+        self.__Freference = (self.__Pmat_linkage @ (self.__Kmat_linkage @ self.__dUreference) ) [self.__freedof]
+        self.__yref = yref[:ndof_free]
+        self.__yref_fixed = yref_fixed[:ndof_fixed]
 
-        F = np.zeros(self.__ntot * 6, dtype=float)
-        for (link, si, sj, A1, A2, B1, B2) in self.__non_linear_link:
+        return t0, Dy0
+
+    def __IVP_derivativeFunc(self, t, Dy):
+
+        Dyfixed = self._get_refbodies_displacement_state(t)
+
+        # Position des corps fixés dans l'espace
+        Ufixed = Dyfixed[:6 * self.__nrefbodies] + self.__yref_fixed
+        Vfixed = Dyfixed[6 * self.__nrefbodies:]
+
+        # Position des corps libres dans l'espace
+        Uvec = Dy[:6 * self.__nbodies] + self.__yref
+        Vvec = Dy[6 * self.__nbodies:]
+
+
+        # Forces de réaction visco-élastiques linéaires
+        F = self.__Freference - (self.__Kff @ Uvec + self.__Cff @ Vvec + self.__Kb @ Ufixed + self.__Cb @ Vfixed)
+
+        if len(self.__non_linear_link)>0 :
+            dUlocal = self.__Qmat_linkage[:, self.__freedof] @ Uvec + \
+                      self.__Qmat_linkage[:, self.__fixeddof] @ Ufixed - self.__dUreference
+            dVlocal = self.__Qmat_linkage[:, self.__freedof] @ Vvec + \
+                      self.__Qmat_linkage[:, self.__fixeddof] @ Vfixed
+            F += self._nonLinearForces(dUlocal, dVlocal)
+
+
+        if self.__n_gapLink > 0 :
+            F += self._penalizedGapContactReactionForces(Uvec, Vvec, Ufixed, Vfixed)
+
+        acc = self.__invMff @ F + self.__gravity_matrix
+
+
+        return np.concatenate([Vvec, acc])
+
+
+    def _nonLinearForces(self, duLocal,dvLocal):
+        Flocal = np.zeros(self.__nlinks * 6)
+
+        for (link,id_link, si, sj, A1, A2, B1, B2) in self.__non_linear_link:
             # extraire U1, V1, U2, V2 (local point displacements)
-            Ui = U[si]
-            Vi = V[si]
-            Uj = U[sj]
-            Vj = V[sj]
-            Ui_point = B1 @ Ui
-            Vi_point = B1 @ Vi
-            Uj_point = B2 @ Uj
-            Vj_point = B2 @ Vj
-
+            s = slice( id_link * 6 , id_link * 6 + 6)
             # appel à la méthode spécifique de la liaison
-            F_torque_point = link.GetNonLinearLocalReactions(Ui_point, Vi_point, Uj_point, Vj_point)
-            # F_torque_point est un vecteur 6 (force, torque) appliqué au point (sur body1), opposite on body2
-            # redispatch to CDG
+            Flocal[s] = link.GetNonLinearLocalReactions(dUlocal = duLocal[s],
+                                                        dVlocal = dvLocal[s])
 
-            F_cdg1 = A1 @ np.asarray(F_torque_point)
-            F_cdg2 = - A2 @ np.asarray(F_torque_point)
-
-            F[si] += F_cdg1
-            F[sj] += F_cdg2
+        F = self.__Pmat_linkage @ Flocal
         return F[self.__freedof]
 
 
-    def _penalizedGapContactReactionForces(self,y , yfixed):
-        ub = yfixed[:6 * self.__nrefbodies]
-        vb = yfixed[6 * self.__nrefbodies:]
-        u = y[:6 * self.__nbodies]
-        v = y[6 * self.__nbodies:]
+    def _penalizedGapContactReactionForces(self, u, v, ub, vb):
 
 
-        du = (self.__Qgap_f @ u + self.__Qgap_b @ ub)
+        du = ((self.__Qgap_f @ u + self.__Qgap_b @ ub) - self.__dUreference[self.__local_gap_index])
+
         dv = (self.__Qgap_f @ v + self.__Qgap_b @ vb)
         du_viol = np.maximum(0., du - self.__gapPlus) +\
                   np.minimum(0., du - self.__gapMinus)
@@ -702,26 +713,9 @@ class MBSMechanicalSystem3D:
 
         return F
 
-    def __IVP_derivativeFunc(self, t, y):
-        yfixed = self._get_refbodies_displacement_state(t)
-        Ufixed = yfixed[:6 * self.__nrefbodies]
-        Vfixed = yfixed[6 * self.__nrefbodies:]
 
-        Uvec = y[:6 * self.__nbodies]
-        Vvec = y[6 * self.__nbodies:]
 
-        # Forces de réaction visco-élastiques linéaires
-        F = -(self.__Kff @ Uvec + self.__Cff @ Vvec + self.__Kb @ Ufixed + self.__Cb @ Vfixed)
-
-        if len(self.__non_linear_link)>0 :
-            F += self._nonLinearForces(y, yfixed)
-        if self.__n_gapLink > 0 :
-            F += self._penalizedGapContactReactionForces(y, yfixed)
-        acc = self.__invMff @ F + self.__gravity_matrix
-
-        return np.concatenate([Vvec, acc])
-
-    def _approxJacobian(self, t=None, y=None):
+    def _approxJacobian(self, t=None, Dy=None):
         if self.__Jac_linear is None :
             n = 6 * self.__nbodies
             A = np.zeros((2 * n, 2 * n))
@@ -734,12 +728,12 @@ class MBSMechanicalSystem3D:
             return self.__Jac_linear
 
         n = 6 * self.__nbodies
-        u = y[:n]
+        u = Dy[:n] + self.__yref
 
-        yref = self._get_refbodies_displacement_state(t)
-        ub = yref[:6 * self.__nrefbodies]
+        Dyref = self._get_refbodies_displacement_state(t)
+        ub = Dyref[:6 * self.__nrefbodies] + self.__yref_fixed
 
-        du = (self.__Qgap_f @ u + self.__Qgap_b @ ub)
+        du = (self.__Qgap_f @ u + self.__Qgap_b @ ub) - self.__dUreference[self.__local_gap_index]
 
         phi0 = np.maximum(0, du - self.__gapPlus) + np.minimum(0, du - self.__gapMinus)
         s_phi = 1.0 * (phi0 > 0) + 1.0 * (phi0 < 0)

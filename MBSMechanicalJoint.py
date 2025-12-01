@@ -36,7 +36,8 @@ class _MBSLink3D:
 
 
         self.__local_point1 = body1.GetBodyLocalCoords(global_point1)
-        self.__local_point2 = body1.GetBodyLocalCoords(global_point2)
+        self.__local_point2 = body2.GetBodyLocalCoords(global_point2)
+
 
 
         self._K = np.zeros((3,3))
@@ -178,7 +179,8 @@ class _MBSLink3D:
 
         return force, torque_rot
 
-    def GetNonLinearLocalReactions(self, U1, V1, U2, V2):
+    def GetNonLinearLocalReactions(self, U1=None, V1=None, U2=None, V2=None,
+                                        dUlocal=None, dVlocal=None):
         return np.zeros(3), np.zeros(3)
 
 
@@ -221,13 +223,13 @@ class MBSLinkKinematic(_MBSLink3D):
                         Rz : int=0.,
                         kinematic_tolerance=1e-4,
                  ):
-        self.__kinematicConstraints = np.array([Tx, Ty, Tz, Rx, Rx, Rz])
+        self.__kinematicConstraints = np.array([Tx, Ty, Tz, Rx, Ry, Rz])
 
-        if (self.__kinematicConstraints != 0 & self.__kinematicConstraints != 1).any() :
-            raise ValueError("Kinematic contraints (Tx, Ty, Tz, Rx, Rx, Rz) must be 0 or +1")
+        if ((self.__kinematicConstraints != 0) & (self.__kinematicConstraints != 1)).any() :
+            raise ValueError("Kinematic contraints (Tx, Ty, Tz, Rx, Ry, Rz) must be 0 or +1")
 
-        M = max(body1.mass, body2.mass)
-        Jm = max(np.max(body1.inertia), np.max(body2.inertia))
+        M = max(body1._mass, body2._mass)
+        Jm = max(np.max(body1._inertia), np.max(body2._inertia))
         k = M / kinematic_tolerance
         c = 2 * np.sqrt(k * M)
         ktheta = Jm / (2 * np.pi * kinematic_tolerance)
@@ -362,13 +364,32 @@ class MBSLinkKinematic(_MBSLink3D):
                                    normalProjectionMatrix]
         self.__linear_reaction = False
 
-    def GetNonLinearLocalReactions(self, U1, V1, U2, V2):
+    def GetNonLinearLocalReactions(self, U1=None, V1=None, U2=None, V2=None,
+                                        dUlocal=None, dVlocal=None):
+        local_disp = True
+        if U1 is None or U2 is None or V1 is None or V1 is None :
+            local_disp = False
+        local_deflection = True
+        if dUlocal is None or dVlocal is None :
+            local_deflection = False
+
+        if (local_disp and local_deflection) or not(local_disp or local_deflection) :
+            raise ValueError("Parameter error")
+
         if self.__rotationFriction is None and self.__translationFriction is None :
             # Dans les faits ce cas n'arrivera pas
             return np.zeros(3), np.zeros(3)
-        dp = U2[:3] - U1[:3]
-        dv = V2[:3] - V1[:3]
-        omega_rel = V2[3:] - V1[3:]
+
+        if local_disp :
+            dp = U2[:3] - U1[:3]
+            dv = V2[:3] - V1[:3]
+            omega_rel = V2[3:] - V1[3:]
+        elif local_deflection :
+            dp = dUlocal[:3]
+            dv = dVlocal[:3]
+            omega_rel = dVlocal[:3]
+        else :
+            raise ValueError("Parameter error")
 
         # Force de ressort + amortisseur
         if self.K is not None or self.C is not None:

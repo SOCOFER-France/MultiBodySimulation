@@ -143,7 +143,7 @@ class MBSReferenceBody3D(MBSRigidBody3D) :
                               inertia_tensor=0.)
         self._is_fixed = True
 
-        self.__zero_func = lambda t : np.zeros_like(t)
+        self.__zero_func = lambda t : np.zeros_like(t, dtype=float)
 
         self.__dX_func = self.__zero_func
         self.__dY_func = self.__zero_func
