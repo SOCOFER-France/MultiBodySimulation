@@ -214,6 +214,14 @@ class MBSReferenceBody3D(MBSRigidBody3D) :
             self._omegaZ_func(t)
         ])
 
+    def ChangeInitialPosition(self, *args, **kwargs):
+        print("Changer la position initiale d'un corps de référence n'est pas possible. "
+              "Cette commande n'a pas d'effet.")
+
+    def ChangeInitialAngle(self, *args, **kwargs):
+        print("Changer l'angle initial d'un corps de référence n'est pas possible. "
+              "Cette commande n'a pas d'effet.")
+
 
 
 

@@ -1,4 +1,5 @@
 import numpy as np
+from typing import List
 
 from MultiBodySimulation.MBSBody import MBSRigidBody3D
 from MultiBodySimulation.MBS_numerics import RotationMatrix
@@ -67,3 +68,54 @@ class MBSDistantPointMotionResults :
         self.positions = positions
         self.velocities = velocities
         self.accelerations = accelerations
+
+
+class MBSModalResults :
+
+    def __init__(self, natural_pulsations : np.array,
+                       modal_displacements : np.array,
+                       body_names_list : List[str]):
+
+
+        self.__naturalPulsations = natural_pulsations
+        self.__naturalFrequencies = natural_pulsations / (np.pi * 2)
+        self.__modalDisplacements = modal_displacements
+        self.__bodiesNames = body_names_list
+
+        self.__nmodes = len(natural_pulsations)
+        self.__nbodies = len(body_names_list)
+
+        shape = (6*self.__nbodies, self.__nmodes)
+        if self.__modalDisplacements.shape != shape:
+            raise ValueError(f"La taille du vecteur des déplacements modaux est incohérent : {self.__modalDisplacements.shape} VS {shape}")
+
+
+    def GetNaturalFrequencies(self):
+        return self.__naturalFrequencies
+
+    def GetNaturalPulsations(self):
+        return self.__naturalPulsations
+
+    def GetDisplacementsByMode(self):
+        """Retourne une liste 'modes' au format :
+            modes[k] = {"body 1" : [x, y, z, rx, ry, rz], ... }
+        """
+        modes = []
+        for k in range(self.__nmodes) :
+            mode_dict = {}
+            for id_body, body in enumerate(self.__bodiesNames):
+                mode_dict[body] = self.__modalDisplacements[6*id_body  : 6*(1+id_body), k]
+            modes.append(mode_dict)
+        return modes
+
+
+    def GetDisplacementsByBodies(self):
+        """Retourne une liste 'modes' au format :
+            modes[body] = [[x, y, z, rx, ry, rz], # mode 1
+                           [x, y, z, rx, ry, rz], # mode 2 ...
+        """
+        modal_results = {}
+        for id_body, body in enumerate(self.__bodiesNames):
+            modal_results[body] = self.__modalDisplacements[6 * id_body: 6 * (1 + id_body)]
+
+        return modal_results

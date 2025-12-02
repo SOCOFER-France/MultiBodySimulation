@@ -2,10 +2,13 @@ import numpy as np
 from typing import Dict, List, Optional
 from scipy.sparse import csc_matrix
 from scipy.integrate import solve_ivp
+from scipy.linalg import eigvalsh, eigh
+import warnings
 
 from MultiBodySimulation.MBSMechanicalJoint import _MBSLink3D
 from MultiBodySimulation.MBSBody import MBSRigidBody3D, MBSReferenceBody3D
-from MultiBodySimulation.MBSSimulationResults import MBSBodySimulationResult
+from MultiBodySimulation.MBSSimulationResults import MBSBodySimulationResult, MBSModalResults
+
 
 
 class __MBSBase:
@@ -17,7 +20,7 @@ class __MBSBase:
     """
 
     def __init__(self):
-        self._assembled = False
+
 
         # Corps et liaisons
         self.bodies: List[MBSRigidBody3D] = []
@@ -39,16 +42,7 @@ class __MBSBase:
         self._freedof = []
         self._fixeddof = []
 
-        # Matrices globales (à assembler par les classes dérivées)
-        self._Kmatrix: Optional[np.ndarray] = None
-        self._Cmatrix: Optional[np.ndarray] = None
-        self._Mmatrix: Optional[np.ndarray] = None
 
-        # Matrices de liaison (système de projection P·K·Q)
-        self._Qmat_linkage: Optional[np.ndarray] = None  # Déplacements CDG → locaux
-        self._Pmat_linkage: Optional[np.ndarray] = None  # Forces locales → CDG
-        self._Kmat_linkage: Optional[np.ndarray] = None  # Raideur locale
-        self._Cmat_linkage: Optional[np.ndarray] = None  # Amortissement local
 
         # Mapping corps → indices matrices
         self.body_index_map: Dict[object, int] = {}
@@ -91,6 +85,123 @@ class __MBSBase:
         if idBody is not None:
             return self.ref_bodies[idBody]
         raise IndexError(f"No body named: '{name}' in the system.")
+
+    def _get_fixedBodies_displacement_state(self, t: float) -> np.ndarray:
+        """
+        Calcule le vecteur déplacement des corps fixes (dynamique imposée) à l'instant t.
+
+        Returns:
+            Array [Δu₁, Δθ₁, ..., Δuₙ, Δθₙ, v₁, ω₁, ..., vₙ, ωₙ]
+        """
+        y = []
+        dydt = []
+        for body in self.ref_bodies:
+            Dy = body._updateDisplacement(t)
+
+            y.append(Dy[:6])  # Déplacements [Δx, Δθ]
+            dydt.append(Dy[6:])  # Vitesses [v, ω]
+        return np.concatenate(y + dydt)
+
+    def _get_fixedBodies_position_state(self, t: float) -> np.ndarray:
+        """
+        Retourne les positions absolues des corps fixes à l'instant t.
+
+        Returns:
+            Array [x₁, θ₁, ..., xₙ, θₙ, v₁, ω₁, ..., vₙ, ωₙ]
+        """
+        y = []
+        dydt = []
+        for body in self.ref_bodies:
+            Dy = body._updateDisplacement(t)
+            # Position absolue = référence + déplacement
+            y.append(Dy[:3] + body._referencePosition)
+            y.append(Dy[3:6] + body._refAngles)
+            dydt.append(Dy[6:])
+        return np.concatenate(y + dydt)
+
+
+    def _get_bodies_initial_displacement(self) -> np.ndarray:
+        """
+        Calcule le vecteur d'état initial des corps libres (déplacements depuis référence).
+
+        Returns:
+            Array [Δu₁, Δθ₁, ..., Δuₙ, Δθₙ, v₁, ω₁, ..., vₙ, ωₙ]
+        """
+        y = []
+        dydt = []
+        for body in self.bodies:
+            # Déplacements initiaux = position_init - position_ref
+            y.append(body._initial_position - body._referencePosition)
+            y.append(body._initial_angles - body._refAngles)
+            # Vitesses initiales
+            dydt.append(body._velocity)
+            dydt.append(body._omega)
+        return np.concatenate(y + dydt)
+
+
+
+class MBSLinearSystem(__MBSBase):
+    """
+    Système multicorps en dynamique linéarisée (petits angles, petits déplacements).
+
+    Hypothèses:
+    - Angles < 10-15° (sin(θ) ≈ θ, cos(θ) ≈ 1)
+    - Déplacements << dimensions caractéristiques
+    - Matrices de transformation constantes
+
+    Variables d'état:
+    - U : déplacements [Δx, Δy, Δz, Δθx, Δθy, Δθz] depuis la configuration de référence
+    - V : vitesses [vx, vy, vz, ωx, ωy, ωz]
+
+    Configuration de référence:
+    - Définie par les positions de référence des corps
+    - Par définition : U_ref = 0 (tous les déplacements nuls)
+    - Aucune précontrainte (F_ref = 0)
+
+    Équation du mouvement:
+    - M·dV/dt = -K·U - C·V + F_ext
+    """
+
+    def __init__(self):
+        super().__init__()
+        self._assembled = False
+
+        # Matrices globales (à assembler par les classes dérivées)
+        self._Kmatrix: Optional[np.ndarray] = None
+        self._Cmatrix: Optional[np.ndarray] = None
+        self._Mmatrix: Optional[np.ndarray] = None
+
+        # Matrices de liaison (système de projection P·K·Q)
+        self._Qmat_linkage: Optional[np.ndarray] = None  # Déplacements CDG → locaux
+        self._Pmat_linkage: Optional[np.ndarray] = None  # Forces locales → CDG
+        self._Kmat_linkage: Optional[np.ndarray] = None  # Raideur locale
+        self._Cmat_linkage: Optional[np.ndarray] = None  # Amortissement local
+
+        # Matrices partitionnées (libres/fixés)
+        self._Mff: Optional[np.ndarray] = None
+        self._invMff: Optional[np.ndarray] = None
+        self._Kff: Optional[np.ndarray] = None
+        self._Cff: Optional[np.ndarray] = None
+        self._Kb: Optional[np.ndarray] = None
+        self._Cb: Optional[np.ndarray] = None
+
+        # Matrices de gap partitionnées
+        self._Pgap_f: Optional[np.ndarray] = None
+        self._Pgap_b: Optional[np.ndarray] = None
+        self._Qgap_f: Optional[np.ndarray] = None
+        self._Qgap_b: Optional[np.ndarray] = None
+
+        # Jacobienne approximée
+        self._Jac_linear: Optional[csc_matrix] = None
+
+        # Gravité matricielle
+        self._gravity_matrix: Optional[np.ndarray] = None
+
+        # Positions de référence (pour reconstruction)
+        self._yref: Optional[np.ndarray] = None
+        self._yref_fixed: Optional[np.ndarray] = None
+
+        self.__max_angle_threshold: Optional[float] = None
 
     def _block_slice(self, body_idx: int) -> slice:
         """Renvoie le slice pour le bloc 6×6 du corps i dans les matrices globales."""
@@ -174,16 +285,13 @@ class __MBSBase:
             D_G1_O = self._vecProductMatrix(G1, O1)
             D_G2_O = self._vecProductMatrix(G2, O2)
 
-
             # Construction matrices A : [I, 0; [GO×], I]
             A1[3:, :3] = D_G1_O
             A2[3:, :3] = D_G2_O
 
-
             # Matrices B = A^T (pour la transformation inverse)
             B1 = A1.T
             B2 = A2.T
-            
 
             # Matrices de raideur et amortissement locales
             Kt, Ct, Kth, Cth = link.GetLinearReactionMatrices
@@ -215,7 +323,6 @@ class __MBSBase:
 
                 Kgap[s_gap, s_gap] += Kloc
                 Cgap[s_gap, s_gap] += Cloc
-
 
                 stop_delta_plus[s_gap_trans] = link.GetTransGap[:, 1]
                 stop_delta_plus[s_gap_rot] = link.GetRotGap[:, 1]
@@ -254,58 +361,6 @@ class __MBSBase:
         # Matrices globales K et C
         self._Kmatrix = self._Pmat_linkage @ self._Kmat_linkage @ self._Qmat_linkage
         self._Cmatrix = self._Pmat_linkage @ self._Cmat_linkage @ self._Qmat_linkage
-
-
-class MBSLinearSystem(__MBSBase):
-    """
-    Système multicorps en dynamique linéarisée (petits angles, petits déplacements).
-
-    Hypothèses:
-    - Angles < 10-15° (sin(θ) ≈ θ, cos(θ) ≈ 1)
-    - Déplacements << dimensions caractéristiques
-    - Matrices de transformation constantes
-
-    Variables d'état:
-    - U : déplacements [Δx, Δy, Δz, Δθx, Δθy, Δθz] depuis la configuration de référence
-    - V : vitesses [vx, vy, vz, ωx, ωy, ωz]
-
-    Configuration de référence:
-    - Définie par les positions de référence des corps
-    - Par définition : U_ref = 0 (tous les déplacements nuls)
-    - Aucune précontrainte (F_ref = 0)
-
-    Équation du mouvement:
-    - M·dV/dt = -K·U - C·V + F_ext
-    """
-
-    def __init__(self):
-        super().__init__()
-
-        # Matrices partitionnées (libres/fixés)
-        self._Mff: Optional[np.ndarray] = None
-        self._invMff: Optional[np.ndarray] = None
-        self._Kff: Optional[np.ndarray] = None
-        self._Cff: Optional[np.ndarray] = None
-        self._Kb: Optional[np.ndarray] = None
-        self._Cb: Optional[np.ndarray] = None
-
-        # Matrices de gap partitionnées
-        self._Pgap_f: Optional[np.ndarray] = None
-        self._Pgap_b: Optional[np.ndarray] = None
-        self._Qgap_f: Optional[np.ndarray] = None
-        self._Qgap_b: Optional[np.ndarray] = None
-
-        # Jacobienne approximée
-        self._Jac_linear: Optional[csc_matrix] = None
-
-        # Gravité matricielle
-        self._gravity_matrix: Optional[np.ndarray] = None
-
-        # Positions de référence (pour reconstruction)
-        self._yref: Optional[np.ndarray] = None
-        self._yref_fixed: Optional[np.ndarray] = None
-
-        self.__max_angle_threshold: Optional[float] = None
 
     def _assemble_mass_matrix(self):
         """Assemble la matrice de masse globale."""
@@ -355,6 +410,8 @@ class MBSLinearSystem(__MBSBase):
         self._Qgap_f = self._Qmat_gap[:, self._freedof]
         self._Qgap_b = self._Qmat_gap[:, self._fixeddof]
 
+
+
     def AssemblyMatrixSystem(self, print_report = False):
         """Assemble le système matriciel complet."""
         self._index_bodies()
@@ -385,7 +442,7 @@ class MBSLinearSystem(__MBSBase):
             raise ValueError("Système non assemblé")
 
         # États initiaux
-        Dyfixed = self._get_refbodies_displacement_state(t0)
+        Dyfixed = self._get_fixedBodies_displacement_state(t0)
         Dy0 = self._get_bodies_initial_displacement()
 
         Ufixed = Dyfixed[:6 * self._nrefbodies]
@@ -433,38 +490,10 @@ class MBSLinearSystem(__MBSBase):
                 print(f"  {b1} >>> {b2} : [Force | Moment]")
                 print(f"    {f}")
 
-    def _get_refbodies_displacement_state(self, t: float) -> np.ndarray:
-        """
-        Calcule le vecteur déplacement des corps fixes (dynamique imposée) à l'instant t.
 
-        Returns:
-            Array [Δu₁, Δθ₁, ..., Δuₙ, Δθₙ, v₁, ω₁, ..., vₙ, ωₙ]
-        """
-        y = []
-        dydt = []
-        for body in self.ref_bodies:
-            Dy = body._updateDisplacement(t)
-            y.append(Dy[:6])  # Déplacements [Δx, Δθ]
-            dydt.append(Dy[6:])  # Vitesses [v, ω]
-        return np.concatenate(y + dydt)
 
-    def _get_bodies_initial_displacement(self) -> np.ndarray:
-        """
-        Calcule le vecteur d'état initial des corps libres (déplacements depuis référence).
 
-        Returns:
-            Array [Δu₁, Δθ₁, ..., Δuₙ, Δθₙ, v₁, ω₁, ..., vₙ, ωₙ]
-        """
-        y = []
-        dydt = []
-        for body in self.bodies:
-            # Déplacements initiaux = position_init - position_ref
-            y.append(body._initial_position - body._referencePosition)
-            y.append(body._initial_angles - body._refAngles)
-            # Vitesses initiales
-            dydt.append(body._velocity)
-            dydt.append(body._omega)
-        return np.concatenate(y + dydt)
+
 
     def _get_bodies_reference_position(self) -> np.ndarray:
         """
@@ -481,22 +510,7 @@ class MBSLinearSystem(__MBSBase):
             dydt.append([0.] * 6)  # Vitesses nulles
         return np.concatenate(y + dydt)
 
-    def _get_refbodies_position_state(self, t: float) -> np.ndarray:
-        """
-        Retourne les positions absolues des corps fixes à l'instant t.
 
-        Returns:
-            Array [x₁, θ₁, ..., xₙ, θₙ, v₁, ω₁, ..., vₙ, ωₙ]
-        """
-        y = []
-        dydt = []
-        for body in self.ref_bodies:
-            Dy = body._updateDisplacement(t)
-            # Position absolue = référence + déplacement
-            y.append(Dy[:3] + body._referencePosition)
-            y.append(Dy[3:6] + body._refAngles)
-            dydt.append(Dy[6:])
-        return np.concatenate(y + dydt)
 
     def _recompose_body_position(self, Dy: np.ndarray) -> np.ndarray:
         """
@@ -547,38 +561,7 @@ class MBSLinearSystem(__MBSBase):
                 return False
         return True
 
-    def _initialState(self, t_eval: np.ndarray) -> tuple:
-        """
-        Calcule l'état initial du système pour la simulation.
 
-        Dans la formulation Option A:
-        - Configuration de référence: U_ref = 0 (tous les déplacements nuls)
-        - Aucune précontrainte: F_ref = 0
-        - État initial = déplacements initiaux depuis la référence
-
-        Args:
-            t_eval: Vecteur temps
-
-        Returns:
-            (t0, Dy0): Instant initial et vecteur d'état initial
-        """
-        t0 = t_eval[0]
-
-        # Configuration de référence: tous les déplacements nuls par définition
-        # Donc: dU_reference = 0, F_reference = 0
-        # (Pas besoin de les stocker, ils sont nuls)
-
-        # Positions de référence (pour reconstruction des positions absolues)
-        self._yref = self._get_bodies_reference_position()[:6 * self._nbodies]
-        self._yref_fixed = self._get_refbodies_position_state(0)[:6 * self._nrefbodies]
-
-        # État initial = déplacements initiaux depuis la référence
-        Dy0 = self._get_bodies_initial_displacement()
-
-        # Vérification validité des angles initiaux
-        self._check_angle_validity(Dy0)
-
-        return t0, Dy0
 
     def _IVP_derivativeFunc(self, t: float, Dy: np.ndarray) -> np.ndarray:
         """
@@ -595,7 +578,7 @@ class MBSLinearSystem(__MBSBase):
             dDy/dt = [v₁, ..., vₙ, a₁, ..., aₙ]
         """
         # Extraction des déplacements et vitesses des corps fixes
-        Dyfixed = self._get_refbodies_displacement_state(t)
+        Dyfixed = self._get_fixedBodies_displacement_state(t)
         Ufixed = Dyfixed[:6 * self._nrefbodies]
         Vfixed = Dyfixed[6 * self._nrefbodies:]
 
@@ -708,7 +691,7 @@ class MBSLinearSystem(__MBSBase):
         n = 6 * self._nbodies
         u = Dy[:n]
 
-        Dyref = self._get_refbodies_displacement_state(t)
+        Dyref = self._get_fixedBodies_displacement_state(t)
         ub = Dyref[:6 * self._nrefbodies]
 
         du = (self._Qgap_f @ u + self._Qgap_b @ ub)
@@ -752,7 +735,9 @@ class MBSLinearSystem(__MBSBase):
         t_eval = np.linspace(t_span[0], t_span[1], nt)
 
         # État initial
-        t0, Dy0 = self._initialState(t_eval)
+        t0 = t_eval[0]
+        Dy0 = self._get_bodies_initial_displacement()
+        self._check_angle_validity(Dy0)
 
         # Jacobienne (constante si pas de gap)
         if self._n_gapLink == 0:
@@ -789,7 +774,7 @@ class MBSLinearSystem(__MBSBase):
 
             # Stockage des résultats
             Dyfixed[:, start_substep:end_substep - 1] = np.array([
-                self._get_refbodies_displacement_state(ti) for ti in t_substep[:-1]
+                self._get_fixedBodies_displacement_state(ti) for ti in t_substep[:-1]
             ]).T
             Dy[:, start_substep:end_substep - 1] = sol.y[:, :-1]
 
@@ -799,7 +784,7 @@ class MBSLinearSystem(__MBSBase):
             # Dernière itération
             if k == substep:
                 Dy[:, -1] = Dy0
-                Dyfixed[:, -1] = self._get_refbodies_displacement_state(t_substep[-1])
+                Dyfixed[:, -1] = self._get_fixedBodies_displacement_state(t_substep[-1])
 
             # Print progression
             if print_step_rate > 1:
@@ -810,7 +795,6 @@ class MBSLinearSystem(__MBSBase):
         self._check_angle_validity(Dy[:, -1])
 
         # Reconstruction des positions absolues
-        print(Dy[0])
         y = self._recompose_body_position(Dy)
         yfixed = self._recompose_ref_body_position(Dyfixed)
 
@@ -836,4 +820,140 @@ class MBSLinearSystem(__MBSBase):
             )
 
         return t_eval, result_dict
+
+
+
+    def _check_linearity(self):
+
+        if self._n_gapLink > 0 or len(self._non_linear_link) > 0:
+            return False
+
+        return True
+
+
+    def __checkEigVals(self, lambda_):
+        if np.any(lambda_ < -1e-10):  # Tolérance pour erreurs numériques
+            n_negative = np.sum(lambda_ < -1e-10)
+            warnings.warn(f"Attention : {n_negative} valeurs propres négatives détectées. "
+                          f"Le système pourrait être instable ou mal conditionné.")
+
+        # Clip les petites valeurs négatives dues aux erreurs numériques
+        lambda_ = np.maximum(lambda_, 0.0)
+        return lambda_
+
+
+    def ComputeModalAnalysis(self, sort_values = False,
+                                   drop_zeros = False):
+        """
+        Réalise l'analyse modale du système.
+
+        :param sort_values: (bool) active le tri croissant ou non des fréquences ;
+        :param drop_zeros: (bool) retire les composantes nulles de l'analyse ;
+
+        :return: modal_results(dict[body_name] = mode)
+        """
+        if not self._assembled :
+            self.AssemblyMatrixSystem()
+
+        if not self._check_linearity() :
+            raise ValueError("Le système n'est pas totalement linéaire. "
+                             "Le système comporte des liaisons non linéaires ou "
+                             "des liaisons de contact avec jeu. "
+                             "L'analyse modale n'est pas possible.")
+
+        if drop_zeros :
+            filtered_rows = ~ np.all( self._Kff == 0, axis=0)
+            K = self._Kff[filtered_rows][:,filtered_rows]
+            M = self._Mff[filtered_rows][:,filtered_rows]
+        else :
+            filtered_rows = np.full(self._nbodies*6,True, dtype=bool)
+            K = self._Kff
+            M = self._Mff
+
+        lambda_, phi_ = eigh(K, M)
+        lambda_ = self.__checkEigVals(lambda_)
+
+        n_mode = len(lambda_)
+
+        # Normalisation  de phi_ pour obtenir
+        # phi_.T @ Mf @ phi_ = Identité
+        # phi_.T @ Kf @ phi_ = lambda_
+        modal_mass = np.diag(phi_.T @ M @ phi_)
+        phi_ = phi_ @ np.diag(1 / np.sqrt(modal_mass))
+
+        # Frequencies and pulsations
+        pulsation = np.sqrt(lambda_)
+
+        # Déplacements modaux
+        modal_displacements = np.zeros((self._nbodies*6, n_mode))
+        modal_displacements[filtered_rows] = phi_
+
+        if sort_values :
+            id_sort = np.argsort(pulsation)
+            pulsation = pulsation[id_sort]
+            modal_displacements = modal_displacements[:, id_sort]
+
+        modal_results = MBSModalResults(pulsation,
+                                        modal_displacements,
+                                        [b.GetName for b in self.bodies])
+
+        return modal_results
+
+
+    def ComputeNaturalPulsations(self,sort_values=False, drop_zeros=False):
+        """
+        Calcul des pulsations de propres du système.
+
+        :param sort_values: (bool) active le tri croissant ou non des valeurs.
+        :param drop_zeros: (bool) retire les colonnes et lignes totalement vides de l'analyse
+
+        :return: numpy array des pulsations propres.
+
+        See Also
+        --------
+        MBSLinearSystem.ComputeNaturalFrequencies
+
+        """
+        if not self._assembled :
+            self.AssemblyMatrixSystem()
+
+        if not self._check_linearity() :
+            raise ValueError("Le système n'est pas totalement linéaire. "
+                             "Le système comporte des liaisons non linéaires ou "
+                             "des liaisons de contact avec jeu. "
+                             "L'analyse modale n'est pas possible.")
+
+        if drop_zeros :
+            filtered_rows = ~ np.all( self._Kff == 0, axis=0)
+            K = self._Kff[filtered_rows][:,filtered_rows]
+            M = self._Mff[filtered_rows][:,filtered_rows]
+        else :
+            K = self._Kff
+            M = self._Mff
+
+        lambda_ = eigvalsh(K,M)
+        lambda_ = self.__checkEigVals(lambda_)
+        omega = np.sqrt(lambda_)
+
+        if sort_values :
+            return np.sort(omega)
+        return omega
+
+    def ComputeNaturalFrequencies(self,sort_values=False, drop_zeros=False):
+        """
+        Calcul des fréquences de propres du système.
+
+        :param sort_values: (bool) active le tri croissant ou non des valeurs.
+        :param drop_zeros: (bool) retire les colonnes et lignes totalement vides de l'analyse
+
+        :return: numpy array des fréquences propres.
+
+        See Also
+        --------
+        MBSLinearSystem.ComputeNaturalPulsations
+
+        """
+        return self.ComputeNaturalPulsations(sort_values, drop_zeros)/(2*np.pi)
+
+
 
