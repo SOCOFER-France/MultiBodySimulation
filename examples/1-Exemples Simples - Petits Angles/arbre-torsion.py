@@ -72,9 +72,9 @@ import sys,socofer
 sys.path.append(socofer.devpy_ala_path)
 from MultiBodySimulation.MBSBody import MBSRigidBody3D,MBSReferenceBody3D
 from MultiBodySimulation.MBSMechanicalJoint import MBSLinkLinearSpringDamper
-from MultiBodySimulation.MBSMechanicalSystem import MBSMechanicalSystem3D
+from MultiBodySimulation.MBSMechanicalSystem import MBSLinearSystem
 
-mecha_sys = MBSMechanicalSystem3D()
+mecha_sys = MBSLinearSystem()
 mecha_sys.gravity = np.array([0.0,0.0,0.0])
 
 RefBody = MBSReferenceBody3D("Ref")

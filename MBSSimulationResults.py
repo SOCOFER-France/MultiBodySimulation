@@ -44,15 +44,16 @@ class MBSBodySimulationResult :
         point_x = np.zeros_like(self.positions)
         point_v = np.zeros_like(self.velocities)
         point_acc = np.zeros_like(self.accelerations)
+        nt = self.positions.shape[1]
 
-        for i in range(len(self.positions)) :
-            angles = self.angles[i]
+        for i in range(nt) :
+            angles = self.angles[:,i]
             R = RotationMatrix(*angles)
 
-            point_x[i] = self.positions[i] + R @ local_point
-            point_v[i] = self.positions[i] + np.cross(self.omega[i], R @ local_point)
+            point_x[:,i] = self.positions[:,i] + R @ local_point
+            point_v[:,i] = self.positions[:,i] + np.cross(self.omega[:,i], R @ local_point)
             if i > 0 :
-                point_acc[i] = (point_v[i] - point_v[i-1]) / (self.time_eval[i] - self.time_eval[i-1])
+                point_acc[:,i] = (point_v[:,i] - point_v[:,i-1]) / (self.time_eval[i] - self.time_eval[i-1])
 
         return MBSDistantPointMotionResults(self.time_eval,
                                             point_x,

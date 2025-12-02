@@ -1,254 +1,158 @@
 import numpy as np
-from typing import Dict
+from typing import Dict, List, Optional
 from scipy.sparse import csc_matrix
 from scipy.integrate import solve_ivp
 
 from MultiBodySimulation.MBSMechanicalJoint import _MBSLink3D
-from MultiBodySimulation.MBSBody import MBSRigidBody3D
+from MultiBodySimulation.MBSBody import MBSRigidBody3D, MBSReferenceBody3D
 from MultiBodySimulation.MBSSimulationResults import MBSBodySimulationResult
 
-class MBSMechanicalSystem3D:
+
+class __MBSBase:
+    """
+    Classe de base pour les systèmes multicorps.
+
+    Gère la structure du système (corps, liaisons) et l'assemblage des matrices.
+    Les classes dérivées implémentent les méthodes de résolution spécifiques.
+    """
+
     def __init__(self):
-        self.__assembled = False
-        self.__mechaConnectors = False
-        self.bodies = []
-        self.body_index = {}
+        self._assembled = False
 
-        self.ref_bodies = []
-        self.ref_body_index = {}
+        # Corps et liaisons
+        self.bodies: List[MBSRigidBody3D] = []
+        self.body_index: Dict[str, int] = {}
+        self.ref_bodies: List[MBSReferenceBody3D] = []
+        self.ref_body_index: Dict[str, int] = {}
+        self.links: List[_MBSLink3D] = []
 
-        self.links = []
+        # Compteurs
+        self._nrefbodies = 0
+        self._nbodies = 0
+        self._ntot = 0
+        self._nlinks = 0
 
-        self.__nrefbodies = 0
-        self.__nbodies = 0
+        # Gravité
+        self.gravity = np.array([0., 0., 0.])
 
-        self.gravity = np.array([0.,0.,0.])
+        # DOF
+        self._freedof = []
+        self._fixeddof = []
 
-        self.__bodies_dof = []
-        self.__freedof = []
-        self.__fixeddof = []
+        # Matrices globales (à assembler par les classes dérivées)
+        self._Kmatrix: Optional[np.ndarray] = None
+        self._Cmatrix: Optional[np.ndarray] = None
+        self._Mmatrix: Optional[np.ndarray] = None
 
-        # matrice de raideur
-        self.__Kmatrix = None
-        # matrice d'amortissement visqueux
-        self.__Cmatrix = None
-        # matrice de masse
-        self.__Mmatrix = None
+        # Matrices de liaison (système de projection P·K·Q)
+        self._Qmat_linkage: Optional[np.ndarray] = None  # Déplacements CDG → locaux
+        self._Pmat_linkage: Optional[np.ndarray] = None  # Forces locales → CDG
+        self._Kmat_linkage: Optional[np.ndarray] = None  # Raideur locale
+        self._Cmat_linkage: Optional[np.ndarray] = None  # Amortissement local
 
-        self.__Mff = None
-        self.__invMff = None
-        self.__Kff = None
-        self.__Cff = None
-        self.__Kb = None
-        self.__Cb = None
-
-        self.__nbodies = 0
-        self.__nrefbodies = 0
-        self.__ntot = 0
-
-        self.__Jac_linear = None
-
-        self.__dUreference = None
-        self.__Freference = None
-        self.__yref = None
-        self.__yref_fixed = None
+        # Mapping corps → indices matrices
+        self.body_index_map: Dict[object, int] = {}
 
     @property
-    def __allbodies(self):
+    def _allbodies(self):
+        """Tous les corps (fixes + libres)"""
         return self.ref_bodies + self.bodies
 
-    def _block_slice(self, body_idx: int) -> slice:
-        """Renvoie slice pour le bloc 6x6 du corps i."""
-        s = 6*body_idx
-        return slice(s, s+6)
+    def AddRigidBody(self, body: MBSRigidBody3D):
+        """Ajoute un corps rigide au système."""
+        if self._assembled:
+            raise ValueError("Cannot add body while system is assembled.")
 
-    def _index_bodies(self):
-        """Crée un mapping corps -> bloc index (start pos in global matrices)."""
-        self.body_index_map: Dict[object, int] = {}
-        for i, b in enumerate(self.__allbodies):
-            self.body_index_map[b] = i
-
-
-        self.__x_indices = []
-        self.__theta_indices = []
-        for i in range(self.__nbodies):
-            s = 6*i
-            self.__x_indices += [s, s+1, s+2]
-            self.__theta_indices += [s+3, s+3 + 1, s+3 + 2]
-
-
-        self.__xref_indices = []
-        self.__thetaref_indices = []
-        for i in range(self.__nrefbodies):
-            s = 6*i
-            self.__xref_indices += [s, s+1, s+2]
-            self.__thetaref_indices += [s+3, s+3 + 1, s+3 + 2]
-
-
-    def __vecProductMatrix(self,A,B):
-        x = (B-A)
-        xi,yi,zi = x
-
-
-        mat = np.array([[0,-zi,yi],
-                        [zi,0,-xi],
-                        [-yi,xi,0]] )
-        return mat
-
-
-
-    def GetBodyByName(self,name):
-        idBody = self.body_index.get(name,None)
-        if idBody is not None :
-            return self.bodies[idBody]
-        idBody = self.ref_body_index.get(name,None)
-        if idBody is not None :
-            return self.ref_bodies[idBody]
-
-        raise IndexError(f"No body named : '{name}' in the system.")
-
-    def AddRigidBody(self, body : MBSRigidBody3D):
-        if self.__assembled :
-            raise ValueError("Cannot connect new body while the system is already assembled.")
-        if body.IsFixed :
+        if body.IsFixed:
             if body.GetName in self.body_index or body.GetName in self.ref_body_index:
                 raise ValueError(f"Body {body.GetName} already exists.")
             self.ref_body_index[body.GetName] = len(self.ref_bodies)
             self.ref_bodies.append(body)
-            self.__nrefbodies = len(self.ref_bodies)
-
-        else :
+            self._nrefbodies = len(self.ref_bodies)
+        else:
             if body.GetName in self.body_index or body.GetName in self.ref_body_index:
                 raise ValueError(f"Body {body.GetName} already exists.")
             self.body_index[body.GetName] = len(self.bodies)
             self.bodies.append(body)
-            self.__nbodies = len(self.bodies)
+            self._nbodies = len(self.bodies)
 
-    def AddLinkage(self, link : _MBSLink3D):
-        if self.__assembled :
-            raise ValueError("Cannot connect new link while the system is already assembled.")
+    def AddLinkage(self, link: _MBSLink3D):
+        """Ajoute une liaison mécanique au système."""
+        if self._assembled:
+            raise ValueError("Cannot add linkage while system is assembled.")
         self.links.append(link)
 
+    def GetBodyByName(self, name: str) -> MBSRigidBody3D:
+        """Récupère un corps par son nom."""
+        idBody = self.body_index.get(name, None)
+        if idBody is not None:
+            return self.bodies[idBody]
+        idBody = self.ref_body_index.get(name, None)
+        if idBody is not None:
+            return self.ref_bodies[idBody]
+        raise IndexError(f"No body named: '{name}' in the system.")
 
-    def _get_refbodies_displacement_state(self, t):
-        y = []
-        dydt = []
-        for body in self.ref_bodies :
-            Dy = body._updateDisplacement(t)
+    def _block_slice(self, body_idx: int) -> slice:
+        """Renvoie le slice pour le bloc 6×6 du corps i dans les matrices globales."""
+        s = 6 * body_idx
+        return slice(s, s + 6)
 
-            y.append(Dy[:6])
-            dydt.append(Dy[6:])
-        return np.concatenate(y + dydt)
+    def _index_bodies(self):
+        """Crée le mapping corps → index dans les matrices globales."""
+        self.body_index_map.clear()
+        for i, b in enumerate(self._allbodies):
+            self.body_index_map[b] = i
 
-    def _get_bodies_initial_displacement(self):
-        y = []
-        dydt = []
-        for body in self.bodies :
-            y.append(body._initial_position - body._referencePosition)
-            y.append(body._initial_angles - body._refAngles)
-            dydt.append(body._velocity)
-            dydt.append(body._omega)
-        return np.concatenate(y + dydt)
+    def _vecProductMatrix(self, A: np.ndarray, B: np.ndarray) -> np.ndarray:
+        """
+        Calcule la matrice antisymétrique du produit vectoriel [x×].
 
-    def _get_refbodies_position_state(self, t):
-        y = []
-        dydt = []
-        for body in self.ref_bodies:
-            Dy = body._updateDisplacement(t)
-            Dy[:3] += body._referencePosition
-            Dy[3:6:] += body._refAngles
-            y.append(Dy[:6])
-            dydt.append(Dy[6:])
-        return np.concatenate(y + dydt)
+        Pour x = B - A, retourne la matrice [x×] tel que [x×]·v = x × v
+        """
+        x = B - A
+        xi, yi, zi = x
+        return np.array([
+            [0, -zi, yi],
+            [zi, 0, -xi],
+            [-yi, xi, 0]
+        ])
 
-    def _get_bodies_reference_position(self):
-        y = []
-        dydt = []
-        for body in self.bodies :
-            y.append(body._referencePosition)
-            y.append(body._refAngles)
-            dydt.append([0.] * 6)
-        return np.concatenate(y + dydt)
+    def _assemble_linkage_matrices(self):
+        """
+        Assemble les matrices de transformation et de raideur des liaisons.
 
-    def _recompose_ref_body_position(self, Dy):
-        y = Dy.copy()
-        for i, body in enumerate(self.ref_bodies):
-            y[6 * i:6 * i + 3] = body._referencePosition[:, None] + Dy[6 * i:6 * i + 3]
-            y[6 * i + 3:6 * i + 6] = body._refAngles[:, None] + Dy[6 * i + 3:6 * i + 6]
-        return y
+        Construit :
+        - Q : projection déplacements CDG → déplacements locaux aux liaisons
+        - K, C : raideur et amortissement locaux
+        - P : transport forces locales → forces au CDG
 
-    def _recompose_body_position(self, Dy):
-        y = Dy.copy()
-        for i, body in enumerate(self.bodies):
-            y[6 * i:6 * i + 3] = body._referencePosition[:, None] + Dy[6 * i:6 * i + 3]
-            y[6 * i + 3:6 * i + 6] = body._refAngles[:, None] + Dy[6 * i + 3:6 * i + 6]
-        return y
+        Relation : F_CDG = P @ K @ Q @ U_CDG
+        """
+        nbodies = len(self._allbodies)
+        self._nlinks = len(self.links)
 
+        # Matrices de liaison (projection P·K·Q)
+        self._Qmat_linkage = np.zeros((6 * self._nlinks, 6 * nbodies))
+        self._Pmat_linkage = np.zeros((6 * nbodies, 6 * self._nlinks))
+        self._Kmat_linkage = np.zeros((6 * self._nlinks, 6 * self._nlinks))
+        self._Cmat_linkage = np.zeros((6 * self._nlinks, 6 * self._nlinks))
 
+        # Cataloguer les liaisons par type
+        self._non_linear_link = []
+        self._linear_link = []
 
-    def _assemble_matrices(self):
-        nbodies = len(self.__allbodies)
-        # matrice de raideur
-        self.__Kmatrix = np.zeros((6*nbodies, 6*nbodies), dtype=float)
-        # matrice d'amortissement visqueux
-        self.__Cmatrix = np.zeros((6*nbodies, 6*nbodies), dtype=float)
-        # matrice de masse
-        self.__Mmatrix = np.zeros((6*nbodies, 6*nbodies), dtype=float)
-        # Matrice Q et P
-        self.__nlinks = len(self.links)
-        self.__Qmat_linkage = np.zeros((6 * self.__nlinks, 6 * nbodies))
-        self.__Pmat_linkage = np.zeros((6 * nbodies, 6 * self.__nlinks))
-        self.__Kmat_linkage = np.zeros((6 * self.__nlinks, 6 * self.__nlinks))
-        self.__Cmat_linkage = np.zeros((6 * self.__nlinks, 6 * self.__nlinks))
-
-        self.__nbodies = len(self.bodies)
-        self.__nrefbodies = len(self.ref_bodies)
-        self.__ntot = self.__nbodies + self.__nrefbodies
-
-        self.__freedof = []
-        self.__fixeddof = []
-
-        self.__gravity_matrix = np.tile(np.concatenate([self.gravity,[0,0,0]]),self.__nbodies)
-
-        for k, body_k in enumerate(self.__allbodies):
-            s = self._block_slice(k)
-            dof = list(range(s.start,s.start+6))
-            if not body_k.IsFixed :
-
-                self.__Mmatrix[s.start:s.start+3][:, s.start:s.start+3] = np.eye(3) * body_k._mass
-                self.__Mmatrix[s.start+3:s.start+6][:, s.start+3:s.start+6] =  body_k._inertia
-
-                self.__freedof += dof
-            else :
-                self.__fixeddof += dof
-
-        # Liaisons non-linéaires
-        self.__non_linear_link = []
-        self.__linear_link = []
-
-        # Liaisons contraintes
-        nconstraints = len([i for i,l in enumerate(self.links) if l.IsKinematic])
-        Pcons = np.zeros((nbodies * 6, 6 * nconstraints))
-        Qcons = np.zeros((nconstraints * 6, 6 * nbodies))
-        Kcons = np.zeros((nconstraints * 6, nconstraints * 6))
-        Ccons = np.zeros((nconstraints * 6, nconstraints * 6))
-        id_constraint = 0
-
-        # Liaisons avec jeu
-        ngap = len([i for i,l in enumerate(self.links) if l.HasGap])
-        self.__n_gapLink = ngap
+        # Liaisons avec gap (butées)
+        ngap = len([link for link in self.links if link.HasGap])
+        self._n_gapLink = ngap
         stop_delta_plus = np.ones(ngap * 6, dtype=float) * np.inf
         stop_delta_minus = -np.ones(ngap * 6, dtype=float) * np.inf
         Pgap = np.zeros((nbodies * 6, 6 * ngap))
         Qgap = np.zeros((ngap * 6, 6 * nbodies))
         Kgap = np.zeros((ngap * 6, ngap * 6))
         Cgap = np.zeros((ngap * 6, ngap * 6))
-        gap_indices = np.zeros(ngap * 6, dtype=int)
         id_gap = 0
 
-
-        for id_link, link in enumerate(self.links) :
-
+        for id_link, link in enumerate(self.links):
             b1 = link.GetBody1
             b2 = link.GetBody2
             i = self.body_index_map[b1]
@@ -256,184 +160,250 @@ class MBSMechanicalSystem3D:
             si = self._block_slice(i)
             sj = self._block_slice(j)
 
+            # Positions de référence
             G1 = b1.GetReferencePosition()
             G2 = b2.GetReferencePosition()
-
             O1 = link.GetGlobalPoint1
             O2 = link.GetGlobalPoint2
 
+            # Matrices de transformation (transport CDG ↔ point de liaison)
             A1 = np.eye(6)
             A2 = np.eye(6)
 
+            # Vecteurs GO (du CDG vers le point de liaison)
+            D_G1_O = self._vecProductMatrix(G1, O1)
+            D_G2_O = self._vecProductMatrix(G2, O2)
 
-            D_G1_O = self.__vecProductMatrix(G1, O1)
-            D_G2_O = self.__vecProductMatrix(G2, O2)
+
+            # Construction matrices A : [I, 0; [GO×], I]
+            A1[3:, :3] = D_G1_O
+            A2[3:, :3] = D_G2_O
 
 
-            A1[3:][:, :3] = D_G1_O
-            A2[3:][:, :3] = D_G2_O
-
+            # Matrices B = A^T (pour la transformation inverse)
             B1 = A1.T
             B2 = A2.T
+            
 
-            # Partie linéaire des réactions
-            Kt,Ct, Kth,Cth = link.GetLinearReactionMatrices
+            # Matrices de raideur et amortissement locales
+            Kt, Ct, Kth, Cth = link.GetLinearReactionMatrices
 
-            # linéaire / non-linéaire
-            link_prop = (link, id_link, si, sj, A1,A2, B1,B2)
-            if link.IsLinear :
-                self.__linear_link.append(link_prop)
-            else :
-                self.__non_linear_link.append(link_prop)
-
-
-            # matrices locales 6x6 liant déplacement point -> effort point
             Kloc = np.zeros((6, 6))
             Cloc = np.zeros((6, 6))
+            Kloc[0:3, 0:3] = Kt
+            Kloc[3:6, 3:6] = Kth
+            Cloc[0:3, 0:3] = Ct
+            Cloc[3:6, 3:6] = Cth
 
-            Kloc[0:3][:, 0:3] = Kt
-            Kloc[3:6][:, 3:6] = Kth
-            Cloc[0:3][:, 0:3] = Ct
-            Cloc[3:6][:, 3:6] = Cth
+            # Cataloguer liaison linéaire/non-linéaire
+            link_prop = (link, id_link, si, sj, A1, A2, B1, B2)
+            if link.IsLinear:
+                self._linear_link.append(link_prop)
+            else:
+                self._non_linear_link.append(link_prop)
 
-
-            if link.IsKinematic :
-                s_cons = slice(id_constraint * 6, id_constraint * 6 + 6)
-                Qcons[s_cons, si] = -B1
-                Qcons[s_cons, sj] = B2
-
-                Pcons[si, s_cons] = -A1
-                Pcons[sj, s_cons] = A2  # Avec A1/B1 - et A2/B2 + ==> P @ K @ Q === Kmat
-
-                Kcons[s_cons, s_cons] = Kloc
-                Ccons[s_cons, s_cons] = Cloc
-
-
-            if link.HasGap :
-                s_gap = slice(id_gap * 6, id_gap*6 + 6)
-                s_gap_trans = slice(id_gap * 6, id_gap*6 + 3)
+            # Traitement des liaisons avec gap (butées)
+            if link.HasGap:
+                s_gap = slice(id_gap * 6, id_gap * 6 + 6)
+                s_gap_trans = slice(id_gap * 6, id_gap * 6 + 3)
                 s_gap_rot = slice(id_gap * 6 + 3, id_gap * 6 + 6)
+
                 Qgap[s_gap, si] = -B1
                 Qgap[s_gap, sj] = B2
-
                 Pgap[si, s_gap] = -A1
-                Pgap[sj, s_gap] = A2  # Avec A1/B1 - et A2/B2 + ==> P @ K @ Q === Kmat
+                Pgap[sj, s_gap] = A2
 
                 Kgap[s_gap, s_gap] += Kloc
                 Cgap[s_gap, s_gap] += Cloc
 
-                gap_indices[s_gap] =  list(range( 6*id_link, 6*id_link + 6 ))
 
-
-                stop_delta_plus[s_gap_trans] = link.GetTransGap[:,1]
+                stop_delta_plus[s_gap_trans] = link.GetTransGap[:, 1]
                 stop_delta_plus[s_gap_rot] = link.GetRotGap[:, 1]
                 stop_delta_minus[s_gap_trans] = link.GetTransGap[:, 0]
                 stop_delta_minus[s_gap_rot] = link.GetRotGap[:, 0]
 
-                Kloc = 0.
-                Cloc = 0.
+                # Pour gap, on ne met pas dans les matrices globales
+                Kloc = np.zeros((6, 6))
+                Cloc = np.zeros((6, 6))
+                id_gap += 1
 
-
+            # Assemblage dans les matrices de liaison globales
             s_linkage = slice(id_link * 6, id_link * 6 + 6)
-            # Avec A1/B1 - et A2/B2 + ==> P @ K @ Q === Kmat
-            self.__Qmat_linkage[s_linkage][:, si] += -B1
-            self.__Qmat_linkage[s_linkage][:, sj] += B2
 
-            self.__Pmat_linkage[si][:, s_linkage] += -A1
-            self.__Pmat_linkage[sj][:, s_linkage] += A2
+            # Q : U_local = Q @ U_CDG = -B1·U1 + B2·U2
+            self._Qmat_linkage[s_linkage, si] += -B1
+            self._Qmat_linkage[s_linkage, sj] += B2
 
-            self.__Kmat_linkage[s_linkage][:, s_linkage] += Kloc
-            self.__Cmat_linkage[s_linkage][:, s_linkage] += Cloc
+            # P : F_CDG = P @ F_local = -A1·F_local sur corps1, +A2·F_local sur corps2
+            self._Pmat_linkage[si, s_linkage] += -A1
+            self._Pmat_linkage[sj, s_linkage] += A2
 
-            # contribution aux matrices globales : T_i^T * Kloc * T_i, etc.
+            # K, C locales
+            self._Kmat_linkage[s_linkage, s_linkage] += Kloc
+            self._Cmat_linkage[s_linkage, s_linkage] += Cloc
 
-            # K11 = A1.dot(Kloc).dot(B1)
-            # K12 = -A1.dot(Kloc).dot(B2)
-            # K22 = A2.dot(Kloc).dot(B2)
-            # K21 = -A2.dot(Kloc).dot(B1)
-            #
-            # C11 = A1.dot(Cloc).dot(B1)
-            # C12 = -A1.dot(Cloc).dot(B2)
-            # C22 = A2.dot(Cloc).dot(B2)
-            # C21 = -A2.dot(Cloc).dot(B1)
-            #
-            #
-            # # assemble in global matrices
-            # self.__Kmatrix[si][:, si] += K11
-            # self.__Kmatrix[sj][:, sj] += K22
-            # self.__Kmatrix[si][:, sj] += K12
-            # self.__Kmatrix[sj][:, si] += K21
-            #
-            # self.__Cmatrix[si][:, si] += C11
-            # self.__Cmatrix[sj][:, sj] += C22
-            # self.__Cmatrix[si][:, sj] += C12
-            # self.__Cmatrix[sj][:, si] += C21
-
-
-
-
+        # Matrices de gap (filtrer les gaps infinis)
         keepgap = (~np.isinf(stop_delta_plus)) & (~np.isinf(stop_delta_minus))
-        self.__Pmat_gap = Pgap[:, keepgap]
-        self.__Qmat_gap = Qgap[keepgap]
-        self.__Kmat_gap = Kgap[keepgap][:, keepgap]
-        self.__Cmat_gap = Cgap[keepgap][:, keepgap]
-        self.__gapPlus = stop_delta_plus[keepgap]
-        self.__gapMinus = stop_delta_minus[keepgap]
-        self.__local_gap_index = gap_indices[keepgap]
+        self._Pmat_gap = Pgap[:, keepgap]
+        self._Qmat_gap = Qgap[keepgap]
+        self._Kmat_gap = Kgap[keepgap][:, keepgap]
+        self._Cmat_gap = Cgap[keepgap][:, keepgap]
+        self._gapPlus = stop_delta_plus[keepgap]
+        self._gapMinus = stop_delta_minus[keepgap]
 
-        self.__Kmatrix = self.__Pmat_linkage @ self.__Kmat_linkage @ self.__Qmat_linkage
-        self.__Cmatrix = self.__Pmat_linkage @ self.__Cmat_linkage @ self.__Qmat_linkage
+        # Matrices globales K et C
+        self._Kmatrix = self._Pmat_linkage @ self._Kmat_linkage @ self._Qmat_linkage
+        self._Cmatrix = self._Pmat_linkage @ self._Cmat_linkage @ self._Qmat_linkage
+
+
+class MBSLinearSystem(__MBSBase):
+    """
+    Système multicorps en dynamique linéarisée (petits angles, petits déplacements).
+
+    Hypothèses:
+    - Angles < 10-15° (sin(θ) ≈ θ, cos(θ) ≈ 1)
+    - Déplacements << dimensions caractéristiques
+    - Matrices de transformation constantes
+
+    Variables d'état:
+    - U : déplacements [Δx, Δy, Δz, Δθx, Δθy, Δθz] depuis la configuration de référence
+    - V : vitesses [vx, vy, vz, ωx, ωy, ωz]
+
+    Configuration de référence:
+    - Définie par les positions de référence des corps
+    - Par définition : U_ref = 0 (tous les déplacements nuls)
+    - Aucune précontrainte (F_ref = 0)
+
+    Équation du mouvement:
+    - M·dV/dt = -K·U - C·V + F_ext
+    """
+
+    def __init__(self):
+        super().__init__()
+
+        # Matrices partitionnées (libres/fixés)
+        self._Mff: Optional[np.ndarray] = None
+        self._invMff: Optional[np.ndarray] = None
+        self._Kff: Optional[np.ndarray] = None
+        self._Cff: Optional[np.ndarray] = None
+        self._Kb: Optional[np.ndarray] = None
+        self._Cb: Optional[np.ndarray] = None
+
+        # Matrices de gap partitionnées
+        self._Pgap_f: Optional[np.ndarray] = None
+        self._Pgap_b: Optional[np.ndarray] = None
+        self._Qgap_f: Optional[np.ndarray] = None
+        self._Qgap_b: Optional[np.ndarray] = None
+
+        # Jacobienne approximée
+        self._Jac_linear: Optional[csc_matrix] = None
+
+        # Gravité matricielle
+        self._gravity_matrix: Optional[np.ndarray] = None
+
+        # Positions de référence (pour reconstruction)
+        self._yref: Optional[np.ndarray] = None
+        self._yref_fixed: Optional[np.ndarray] = None
+
+        self.__max_angle_threshold: Optional[float] = None
+
+    def _assemble_mass_matrix(self):
+        """Assemble la matrice de masse globale."""
+        nbodies = len(self._allbodies)
+        self._Mmatrix = np.zeros((6 * nbodies, 6 * nbodies), dtype=float)
+
+        self._freedof = []
+        self._fixeddof = []
+
+        for k, body_k in enumerate(self._allbodies):
+            s = self._block_slice(k)
+            dof = list(range(s.start, s.start + 6))
+
+            if not body_k.IsFixed:
+                # Masse translation
+                self._Mmatrix[s.start:s.start + 3, s.start:s.start + 3] = np.eye(3) * body_k._mass
+                # Inertie rotation (au CDG)
+                self._Mmatrix[s.start + 3:s.start + 6, s.start + 3:s.start + 6] = body_k._inertia
+                self._freedof += dof
+            else:
+                self._fixeddof += dof
+
+        # Gravité matricielle (répétée pour chaque corps libre)
+        self._gravity_matrix = np.tile(
+            np.concatenate([self.gravity, [0, 0, 0]]),
+            self._nbodies
+        )
 
     def _partition_matrices(self):
-        """Partitionne M,C,K et F en sous-systèmes libres/prescrits :
-                   Retourne (invMff, Cff, Kff, Kfb, Cfb)
-                """
-        if self.__Kmatrix is None : return
+        """Partitionne les matrices en sous-systèmes libres/fixés."""
+        if self._Kmatrix is None:
+            return
 
-        self.__Mff = self.__Mmatrix[self.__freedof][:,self.__freedof]
-        self.__invMff = np.linalg.inv(self.__Mff)
-        self.__Kff = self.__Kmatrix[self.__freedof][:,self.__freedof]
-        self.__Cff = self.__Cmatrix[self.__freedof][:,self.__freedof]
-        self.__Kb = self.__Kmatrix[self.__freedof][:,self.__fixeddof]
-        self.__Cb = self.__Cmatrix[self.__freedof][:,self.__fixeddof]
+        # Sous-matrices libres
+        self._Mff = self._Mmatrix[self._freedof][:, self._freedof]
+        self._invMff = np.linalg.inv(self._Mff)
+        self._Kff = self._Kmatrix[self._freedof][:, self._freedof]
+        self._Cff = self._Cmatrix[self._freedof][:, self._freedof]
 
-        self.__Pgap_f = self.__Pmat_gap[self.__freedof]
-        self.__Pgap_b = self.__Pmat_gap[self.__fixeddof]
-        self.__Qgap_f = self.__Qmat_gap[:,self.__freedof]
-        self.__Qgap_b = self.__Qmat_gap[:,self.__fixeddof]
-        return
+        # Couplage avec corps fixés
+        self._Kb = self._Kmatrix[self._freedof][:, self._fixeddof]
+        self._Cb = self._Cmatrix[self._freedof][:, self._fixeddof]
 
+        # Matrices de gap partitionnées
+        self._Pgap_f = self._Pmat_gap[self._freedof]
+        self._Pgap_b = self._Pmat_gap[self._fixeddof]
+        self._Qgap_f = self._Qmat_gap[:, self._freedof]
+        self._Qgap_b = self._Qmat_gap[:, self._fixeddof]
 
+    def AssemblyMatrixSystem(self, print_report = False):
+        """Assemble le système matriciel complet."""
+        self._index_bodies()
+        self._ntot = self._nbodies + self._nrefbodies
+        self._assemble_mass_matrix()
+        self._assemble_linkage_matrices()
+        self._partition_matrices()
+        self._assembled = True
 
-    def CheckInitialTensions(self, t0):
-        if not self.__assembled :
+        if print_report :
+            print(f"\n{'=' * 60}")
+            print("SYSTÈME ASSEMBLÉ")
+            print(f"{'=' * 60}")
+            print(f"Corps libres : {self._nbodies}")
+            print(f"Corps fixes : {self._nrefbodies}")
+            print(f"Liaisons : {len(self.links)}")
+            print(f"DOF libres : {len(self._freedof)}")
+            print(f"DOF fixés : {len(self._fixeddof)}")
+
+    def CheckInitialTensions(self, t0: float = 0.0):
+        """
+        Vérifie les tensions initiales dans les liaisons.
+
+        Affiche un avertissement si des forces/moments non nuls existent
+        en configuration initiale.
+        """
+        if not self._assembled:
             raise ValueError("Système non assemblé")
 
-        y0_fixed = self._get_refbodies_displacement_state(t0)
-        y0 = self._get_bodies_initial_displacement()  # vecteur déplacement / vitesse (dX, v, dTheta, omega)
+        # États initiaux
+        Dyfixed = self._get_refbodies_displacement_state(t0)
+        Dy0 = self._get_bodies_initial_displacement()
 
-        Ufixed = y0_fixed[:6 * self.__nrefbodies]
-        Vfixed = y0_fixed[6 * self.__nrefbodies:]
+        Ufixed = Dyfixed[:6 * self._nrefbodies]
+        Vfixed = Dyfixed[6 * self._nrefbodies:]
+        Uvec = Dy0[:6 * self._nbodies]
+        Vvec = Dy0[6 * self._nbodies:]
 
-        Uvec = y0[:6 * self.__nbodies]
-        Vvec = y0[6 * self.__nbodies:]
-
-        U = np.zeros(6 * self.__ntot, dtype=float)
+        # Reconstruction état global
+        U = np.zeros(6 * self._ntot, dtype=float)
         V = np.zeros_like(U, dtype=float)
-        U[self.__fixeddof] = Ufixed
-        U[self.__freedof] = Uvec
-        V[self.__fixeddof] = Vfixed
-        V[self.__freedof] = Vvec
+        U[self._fixeddof] = Ufixed
+        U[self._freedof] = Uvec
+        V[self._fixeddof] = Vfixed
+        V[self._freedof] = Vvec
 
+        # Vérifier tensions dans chaque liaison
         init_tension = []
-        for (link, si, sj, A1, A2, B1, B2) in self.__non_linear_link + self.__linear_link :
-            b1 = link.GetBody1
-            b2 = link.GetBody2
-            i = self.body_index_map[b1]
-            j = self.body_index_map[b2]
-            si = self._block_slice(i)
-            sj = self._block_slice(j)
-
+        for link, id_link, si, sj, A1, A2, B1, B2 in (self._non_linear_link + self._linear_link):
             Ui = U[si]
             Vi = V[si]
             Uj = U[sj]
@@ -444,305 +414,426 @@ class MBSMechanicalSystem3D:
             Uj_point = B2 @ Uj
             Vj_point = B2 @ Vj
 
-
-            if link.IsLinear :
+            if link.IsLinear:
                 f = link.GetLinearLocalReactions(Ui_point, Vi_point, Uj_point, Vj_point)
-            else :
+            else:
                 f = link.GetNonLinearLocalReactions(Ui_point, Vi_point, Uj_point, Vj_point)
 
-            if (np.abs(f)>0).any() :
-                init_tension.append( (b1.GetName, b2.GetName, np.round(f[:6],5) ) )
-        if len(init_tension)>0:
-            print("Warning : tension initiale dans des liaisons.")
-        for (b1,b2,f) in init_tension :
-            print(b1,">>>",b2," : {force | torque}\n", f)
+            force, torque = f
+            f_total = np.concatenate([force, torque])
 
-    def _non_linear_forces(self,y, yfixed):
-        U = np.zeros(6 * self.__ntot, dtype=float)
-        V = np.zeros_like(U, dtype=float)
+            if np.any(np.abs(f_total) > 1e-6):
+                b1 = link.GetBody1
+                b2 = link.GetBody2
+                init_tension.append((b1.GetName, b2.GetName, np.round(f_total, 5)))
 
-        U[self.__fixeddof] = yfixed[:6 * self.__nrefbodies]
-        V[self.__fixeddof] = yfixed[6 * self.__nrefbodies:]
-        U[self.__freedof] = y[:6 * self.__nbodies]
-        V[self.__freedof] = y[6 * self.__nbodies:]
+        if len(init_tension) > 0:
+            print("\n⚠️  Tensions initiales détectées dans les liaisons:")
+            for b1, b2, f in init_tension:
+                print(f"  {b1} >>> {b2} : [Force | Moment]")
+                print(f"    {f}")
 
-        F = np.zeros(self.__ntot*6, dtype=float)
-        for (link, si, sj, A1,A2, B1,B2) in self.__non_linear_link:
+    def _get_refbodies_displacement_state(self, t: float) -> np.ndarray:
+        """
+        Calcule le vecteur déplacement des corps fixes (dynamique imposée) à l'instant t.
 
-            # extraire U1, V1, U2, V2 (local point displacements)
-            Ui = U[si]
-            Vi = V[si]
-            Uj = U[sj]
-            Vj = V[sj]
-            Ui_point = B1 @ Ui
-            Vi_point = B1 @ Vi
-            Uj_point = B2 @ Uj
-            Vj_point = B2 @ Vj
+        Returns:
+            Array [Δu₁, Δθ₁, ..., Δuₙ, Δθₙ, v₁, ω₁, ..., vₙ, ωₙ]
+        """
+        y = []
+        dydt = []
+        for body in self.ref_bodies:
+            Dy = body._updateDisplacement(t)
+            y.append(Dy[:6])  # Déplacements [Δx, Δθ]
+            dydt.append(Dy[6:])  # Vitesses [v, ω]
+        return np.concatenate(y + dydt)
 
-            # appel à la méthode spécifique de la liaison
-            F_torque_point = link.GetNonLinearLocalReactions(Ui_point, Vi_point, Uj_point, Vj_point)
-            # F_torque_point est un vecteur 6 (force, torque) appliqué au point (sur body1), opposite on body2
-            # redispatch to CDG
+    def _get_bodies_initial_displacement(self) -> np.ndarray:
+        """
+        Calcule le vecteur d'état initial des corps libres (déplacements depuis référence).
 
-            F_cdg1 = A1 @ np.asarray(F_torque_point)
-            F_cdg2 = - A2 @ np.asarray(F_torque_point)
+        Returns:
+            Array [Δu₁, Δθ₁, ..., Δuₙ, Δθₙ, v₁, ω₁, ..., vₙ, ωₙ]
+        """
+        y = []
+        dydt = []
+        for body in self.bodies:
+            # Déplacements initiaux = position_init - position_ref
+            y.append(body._initial_position - body._referencePosition)
+            y.append(body._initial_angles - body._refAngles)
+            # Vitesses initiales
+            dydt.append(body._velocity)
+            dydt.append(body._omega)
+        return np.concatenate(y + dydt)
 
-            F[si] += F_cdg1
-            F[sj] += F_cdg2
-        return F[self.__freedof]
+    def _get_bodies_reference_position(self) -> np.ndarray:
+        """
+        Retourne les positions de référence des corps libres.
+
+        Returns:
+            Array [x_ref₁, θ_ref₁, ..., x_refₙ, θ_refₙ, 0, 0, ..., 0]
+        """
+        y = []
+        dydt = []
+        for body in self.bodies:
+            y.append(body._referencePosition)
+            y.append(body._refAngles)
+            dydt.append([0.] * 6)  # Vitesses nulles
+        return np.concatenate(y + dydt)
+
+    def _get_refbodies_position_state(self, t: float) -> np.ndarray:
+        """
+        Retourne les positions absolues des corps fixes à l'instant t.
+
+        Returns:
+            Array [x₁, θ₁, ..., xₙ, θₙ, v₁, ω₁, ..., vₙ, ωₙ]
+        """
+        y = []
+        dydt = []
+        for body in self.ref_bodies:
+            Dy = body._updateDisplacement(t)
+            # Position absolue = référence + déplacement
+            y.append(Dy[:3] + body._referencePosition)
+            y.append(Dy[3:6] + body._refAngles)
+            dydt.append(Dy[6:])
+        return np.concatenate(y + dydt)
+
+    def _recompose_body_position(self, Dy: np.ndarray) -> np.ndarray:
+        """
+        Reconstruit les positions absolues depuis les déplacements.
+
+        Args:
+            Dy: Déplacements [Δu₁, Δθ₁, ..., v₁, ω₁, ...]
+
+        Returns:
+            Positions absolues [x₁, θ₁, ..., v₁, ω₁, ...]
+        """
+        y = Dy.copy()
+        for i, body in enumerate(self.bodies):
+            # Position = référence + déplacement
+            y[6 * i:6 * i + 3] = body._referencePosition[:, None] + Dy[6 * i:6 * i + 3]
+            y[6 * i + 3:6 * i + 6] = body._refAngles[:, None] + Dy[6 * i + 3:6 * i + 6]
+        return y
+
+    def _recompose_ref_body_position(self, Dy: np.ndarray) -> np.ndarray:
+        """Reconstruit les positions absolues des corps fixes."""
+        y = Dy.copy()
+        for i, body in enumerate(self.ref_bodies):
+            y[6 * i:6 * i + 3] = body._referencePosition[:, None] + Dy[6 * i:6 * i + 3]
+            y[6 * i + 3:6 * i + 6] = body._refAngles[:, None] + Dy[6 * i + 3:6 * i + 6]
+        return y
+
+    def _check_angle_validity(self, Dy: np.ndarray) -> bool:
+        """
+        Vérifie que les angles restent dans le domaine de validité des petits angles.
+
+        Args:
+            Dy: Vecteur d'état [Δu, v]
+
+        Returns:
+            True si tous les angles sont < self.__max_angle_threshold
+        """
+        if self.__max_angle_threshold is None :
+            return True
+        max_angle_rad = self.__max_angle_threshold * np.pi / 180.0
+
+        for i in range(self._nbodies):
+            angles = Dy[6 * i + 3:6 * i + 6]
+            if np.any(np.abs(angles) > max_angle_rad):
+                print(f"\n⚠️  AVERTISSEMENT: Angles hors du domaine de validité!")
+                print(f"   Corps {self.bodies[i].GetName}: θ = {np.rad2deg(angles)} °")
+                print(f"   Limite de validité: ±{self.__max_angle_threshold}")
+                print(f"   Les résultats peuvent être inexacts.")
+                return False
+        return True
+
+    def _initialState(self, t_eval: np.ndarray) -> tuple:
+        """
+        Calcule l'état initial du système pour la simulation.
+
+        Dans la formulation Option A:
+        - Configuration de référence: U_ref = 0 (tous les déplacements nuls)
+        - Aucune précontrainte: F_ref = 0
+        - État initial = déplacements initiaux depuis la référence
+
+        Args:
+            t_eval: Vecteur temps
+
+        Returns:
+            (t0, Dy0): Instant initial et vecteur d'état initial
+        """
+        t0 = t_eval[0]
+
+        # Configuration de référence: tous les déplacements nuls par définition
+        # Donc: dU_reference = 0, F_reference = 0
+        # (Pas besoin de les stocker, ils sont nuls)
+
+        # Positions de référence (pour reconstruction des positions absolues)
+        self._yref = self._get_bodies_reference_position()[:6 * self._nbodies]
+        self._yref_fixed = self._get_refbodies_position_state(0)[:6 * self._nrefbodies]
+
+        # État initial = déplacements initiaux depuis la référence
+        Dy0 = self._get_bodies_initial_displacement()
+
+        # Vérification validité des angles initiaux
+        self._check_angle_validity(Dy0)
+
+        return t0, Dy0
+
+    def _IVP_derivativeFunc(self, t: float, Dy: np.ndarray) -> np.ndarray:
+        """
+        Fonction dérivée pour l'intégrateur (dDy/dt = f(t, Dy)).
+
+        Équation du mouvement (Option A - déplacements purs):
+        M·dV/dt = -K·U - C·V + F_ext + F_nonlinear + F_gap
+
+        Args:
+            t: Temps
+            Dy: Vecteur d'état [Δu₁, ..., Δuₙ, v₁, ..., vₙ]
+
+        Returns:
+            dDy/dt = [v₁, ..., vₙ, a₁, ..., aₙ]
+        """
+        # Extraction des déplacements et vitesses des corps fixes
+        Dyfixed = self._get_refbodies_displacement_state(t)
+        Ufixed = Dyfixed[:6 * self._nrefbodies]
+        Vfixed = Dyfixed[6 * self._nrefbodies:]
+
+        # Extraction des déplacements et vitesses des corps libres
+        Uvec = Dy[:6 * self._nbodies]  # Déplacements [Δu, Δθ]
+        Vvec = Dy[6 * self._nbodies:]  # Vitesses [v, ω]
+
+        # Forces de réaction visco-élastiques LINÉAIRES
+        # Option A: pas de F_ref car U_ref = 0 par définition
+        # F = -K·U - C·V (signe moins car forces de rappel)
+        F = -(self._Kff @ Uvec + self._Cff @ Vvec +
+              self._Kb @ Ufixed + self._Cb @ Vfixed)
 
 
-    def AssemblyMatrixSystem(self):
-        self._index_bodies()
-        self._assemble_matrices()
-        self._partition_matrices()
-        self.__assembled = True
+        # Ajout des forces NON-LINÉAIRES (frottement, etc.)
+        if len(self._non_linear_link) > 0:
+            # Déplacements locaux aux liaisons
+            dUlocal = (self._Qmat_linkage[:, self._freedof] @ Uvec +
+                       self._Qmat_linkage[:, self._fixeddof] @ Ufixed)
+            dVlocal = (self._Qmat_linkage[:, self._freedof] @ Vvec +
+                       self._Qmat_linkage[:, self._fixeddof] @ Vfixed)
+
+            F += self._nonLinearForces(dUlocal, dVlocal)
+
+        # Ajout des forces de contact GAP (butées)
+        if self._n_gapLink > 0:
+            F += self._penalizedGapContactReactionForces(Uvec, Vvec, Ufixed, Vfixed)
+
+        # Accélérations = M⁻¹·F + g
+        acc = self._invMff @ F + self._gravity_matrix
 
 
-    def RunDynamicSimulation(self, t_span, dt, ode_method="BDF", print_step_rate=0,
-                             smallAngles = True , smallAnglesDegreesThreshold=5.0):
-        if not self.__assembled :
+        # Retour: dDy/dt = [V, acc]
+        return np.concatenate([Vvec, acc])
+
+    def _nonLinearForces(self, duLocal: np.ndarray, dvLocal: np.ndarray) -> np.ndarray:
+        """
+        Calcule les forces non-linéaires (frottement, etc.).
+
+        Args:
+            duLocal: Déplacements locaux aux liaisons
+            dvLocal: Vitesses locales aux liaisons
+
+        Returns:
+            Forces au CDG des corps libres
+        """
+        Flocal = np.zeros(self._nlinks * 6)
+
+        for link, id_link, si, sj, A1, A2, B1, B2 in self._non_linear_link:
+            s = slice(id_link * 6, id_link * 6 + 6)
+            force, torque = link.GetNonLinearLocalReactions(
+                dUlocal=duLocal[s],
+                dVlocal=dvLocal[s]
+            )
+            Flocal[s] = np.concatenate([force, torque])
+
+        # Transport au CDG
+        F = self._Pmat_linkage @ Flocal
+        return F[self._freedof]
+
+    def _penalizedGapContactReactionForces(self, u: np.ndarray, v: np.ndarray,
+                                           ub: np.ndarray, vb: np.ndarray) -> np.ndarray:
+        """
+        Calcule les forces de contact pénalisées (butées avec jeu).
+
+        Args:
+            u, v: Déplacements et vitesses corps libres
+            ub, vb: Déplacements et vitesses corps fixes
+
+        Returns:
+            Forces de contact au CDG des corps libres
+        """
+        # Déplacements locaux aux gaps
+        du = (self._Qgap_f @ u + self._Qgap_b @ ub)
+        dv = (self._Qgap_f @ v + self._Qgap_b @ vb)
+
+        # Pénétration (activation uniquement si gap violé)
+        du_viol = (np.maximum(0., du - self._gapPlus) +
+                   np.minimum(0., du - self._gapMinus))
+        dv_viol = dv * (np.abs(du_viol) > 0.)
+
+        # Forces de contact
+        F = -self._Pgap_f @ (self._Kmat_gap @ du_viol + self._Cmat_gap @ dv_viol)
+
+        return F
+
+    def _approxJacobian(self, t: Optional[float] = None,
+                        Dy: Optional[np.ndarray] = None) -> csc_matrix:
+        """
+        Calcule la jacobienne approximée pour l'intégrateur implicite.
+
+        J = ∂f/∂Dy = [  0      I  ]
+                     [-M⁻¹K  -M⁻¹C]
+
+        Pour les gaps, ajoute une contribution dépendant de l'état.
+        """
+        if self._Jac_linear is None:
+            n = 6 * self._nbodies
+            A = np.zeros((2 * n, 2 * n))
+            A[:n, n:] = np.eye(n)
+            A[n:, :n] = -self._invMff @ self._Kff  # Signe + car F = -K·U
+            A[n:, n:] = -self._invMff @ self._Cff  # Signe + car F = -C·V
+            self._Jac_linear = csc_matrix(A)
+
+        # Si pas de gap, jacobienne constante
+        if self._n_gapLink == 0:
+            return self._Jac_linear
+
+        # Avec gaps, ajout de la contribution variable
+        n = 6 * self._nbodies
+        u = Dy[:n]
+
+        Dyref = self._get_refbodies_displacement_state(t)
+        ub = Dyref[:6 * self._nrefbodies]
+
+        du = (self._Qgap_f @ u + self._Qgap_b @ ub)
+
+        # Détection des gaps activés
+        phi0 = np.maximum(0, du - self._gapPlus) + np.minimum(0, du - self._gapMinus)
+        s_phi = 1.0 * (phi0 > 0) + 1.0 * (phi0 < 0)
+        Pf = self._Pgap_f * s_phi[np.newaxis]
+
+        # Contribution des gaps à la jacobienne
+        Agap_penal = np.zeros((2 * n, 2 * n))
+        Agap_penal[n:, :n] = -self._invMff @ (Pf @ (self._Kmat_gap @ self._Qgap_f))
+        Agap_penal[n:, n:] = -self._invMff @ (Pf @ (self._Cmat_gap @ self._Qgap_f))
+        Agap_penal = csc_matrix(Agap_penal)
+
+        return Agap_penal + self._Jac_linear
+
+    def RunDynamicSimulation(self, t_span: tuple, dt: float,
+                             ode_method: str = "BDF",
+                             print_step_rate: int = 0,
+                             max_angle_threshold:(float|None) = None) -> tuple:
+        """
+        Lance la simulation dynamique du système.
+
+        Args:
+            t_span: Intervalle de temps (t_start, t_end)
+            dt: Pas de temps
+            ode_method: Méthode d'intégration ("BDF" ou "Radau")
+            print_step_rate: Nombre de prints pendant simulation (0 = désactivé)
+
+        Returns:
+            (t_eval, results): Vecteur temps et dictionnaire des résultats par corps
+        """
+        self.__max_angle_threshold = max_angle_threshold
+
+        if not self._assembled:
             self.AssemblyMatrixSystem()
 
-        if not smallAngles :
-            smallAnglesThreshold = smallAnglesDegreesThreshold / 180 * np.pi
-        else :
-            smallAnglesThreshold = None
-
-        nt = int( np.ceil( (t_span[1] - t_span[0]) / dt ) + 1 )
+        # Génération du vecteur temps
+        nt = int(np.ceil((t_span[1] - t_span[0]) / dt)) + 1
         t_eval = np.linspace(t_span[0], t_span[1], nt)
-        new_dt = t_eval[1] - t_eval[0]
-        if not np.isclose(new_dt, dt) :
-            print(f"Recalcule de dt >> {dt:.4e}  --> {new_dt:.4e}")
 
+        # État initial
+        t0, Dy0 = self._initialState(t_eval)
 
-        if ode_method in ["BDF", "Radau"] :
-            y, yfixed, Dy, Dyfixed = self._RunSolveIVP(t_eval,
-                                                       print_step_rate,
-                                                       method = ode_method,
-                                                       smallAnglesThreshold = smallAnglesThreshold)
+        # Jacobienne (constante si pas de gap)
+        if self._n_gapLink == 0:
+            jac = self._approxJacobian()
+        else:
+            jac = self._approxJacobian  # Fonction appelée à chaque pas
 
+        # Configuration des prints
+        if print_step_rate <= 1:
+            substep = 1
+            steps = np.array([0, nt], dtype=int)
+        else:
+            steps = np.unique([int(s) for s in np.linspace(0, nt, print_step_rate)])
+            substep = len(steps) - 1
+
+        # Allocation mémoire pour résultats
+        Dy = np.zeros((self._nbodies * 12, nt))
+        Dyfixed = np.zeros((self._nrefbodies * 12, nt))
+
+        # Boucle d'intégration (par sous-intervalles si print activé)
+        for k, (start_substep, end_substep) in enumerate(zip(steps[:-1], steps[1:]), start=1):
+            t_substep = t_eval[start_substep:end_substep]
+            t_span_sub = (t_substep[0], t_substep[-1])
+
+            # Intégration
+            sol = solve_ivp(
+                self._IVP_derivativeFunc,
+                t_span_sub,
+                Dy0,
+                method=ode_method,
+                t_eval=t_substep,
+                jac=jac,
+            )
+
+            # Stockage des résultats
+            Dyfixed[:, start_substep:end_substep - 1] = np.array([
+                self._get_refbodies_displacement_state(ti) for ti in t_substep[:-1]
+            ]).T
+            Dy[:, start_substep:end_substep - 1] = sol.y[:, :-1]
+
+            # Préparation pas suivant
+            Dy0 = sol.y[:, -1]
+
+            # Dernière itération
+            if k == substep:
+                Dy[:, -1] = Dy0
+                Dyfixed[:, -1] = self._get_refbodies_displacement_state(t_substep[-1])
+
+            # Print progression
+            if print_step_rate > 1:
+                progress = k / substep * 100
+                print(f"Simulation: {progress:.1f}% ({k}/{substep})")
+
+        # Vérification finale de validité des angles
+        self._check_angle_validity(Dy[:, -1])
+
+        # Reconstruction des positions absolues
+        print(Dy[0])
+        y = self._recompose_body_position(Dy)
+        yfixed = self._recompose_ref_body_position(Dyfixed)
+
+        # Construction du dictionnaire de résultats
         result_dict = {}
 
         for body in self.ref_bodies:
             idx = self.ref_body_index[body.GetName]
-            Dy_body = Dyfixed[6 * idx : 6 * (idx + 1)] # Dx,angle,
-            y_body = yfixed[6 * idx : 6 * (idx + 1)] # Positions, angle
-            v_body = Dyfixed[12*self.__nrefbodies + 6 * idx: 12*self.__nrefbodies + 6 * (idx+1)] # V omega
-            result_dict[body.GetName] = MBSBodySimulationResult(body,
-                                                             t_eval,
-                                                             Dy_body,
-                                                             y_body,
-                                                             v_body)
+            Dy_body = Dyfixed[6 * idx:6 * (idx + 1)]
+            y_body = yfixed[6 * idx:6 * (idx + 1)]
+            v_body = Dyfixed[6 * self._nrefbodies + 6 * idx:6 * self._nrefbodies + 6 * (idx + 1)]
+            result_dict[body.GetName] = MBSBodySimulationResult(
+                body, t_eval, Dy_body, y_body, v_body
+            )
 
         for body in self.bodies:
             idx = self.body_index[body.GetName]
-            Dy_body = Dy[6 * idx: 6 * (idx + 1)]  # Dx,angle,
-            y_body = y[6 * idx: 6 * (idx + 1)]  # Positions, angle
-            v_body = Dy[12 * self.__nbodies + 6 * idx: 12 * self.__nbodies + 6 * (idx + 1)]  # V omega
-            result_dict[body.GetName] = MBSBodySimulationResult(body,
-                                                                t_eval,
-                                                                Dy_body,
-                                                                y_body,
-                                                                v_body)
+            Dy_body = Dy[6 * idx:6 * (idx + 1)]
+            y_body = y[6 * idx:6 * (idx + 1)]
+            v_body = Dy[6 * self._nbodies + 6 * idx:6 * self._nbodies + 6 * (idx + 1)]
+            result_dict[body.GetName] = MBSBodySimulationResult(
+                body, t_eval, Dy_body, y_body, v_body
+            )
+
         return t_eval, result_dict
-
-
-
-    def _RunSolveIVP(self, t_eval,
-                     print_step_rate : int =0,
-                     method : str = "BDF",
-                     smallAnglesThreshold = None):
-        if not isinstance(print_step_rate, int) :
-            raise TypeError("'print_step_rate' must be integer. 0 to disable printing.")
-
-
-        nt = len(t_eval)
-        t0, Dy0 = self.__initialState(t_eval)
-
-
-        if print_step_rate <= 1 :
-            substep = 1
-            steps = np.array([0,nt],dtype=int)
-        else :
-            steps = np.unique([int(s) for s in np.linspace(0,nt,print_step_rate)])
-            substep = len(steps) - 1
-
-        Dy = np.zeros((self.__nbodies * 12, nt))
-        Dyfixed = np.zeros((self.__nrefbodies * 12, nt))
-
-        # Notes :
-        # Dy << vecteur état déplacements des corps libres 12 composantes
-        # Dx déplacement / déformation translation
-        # Dtheta déformation angulaire
-        # Vx vitesse en translation
-        # omega vitesse angulaire
-        # structure Dy = { [Dx, Dtheta]_0,
-        #                  [Dx, Dtheta]_1,
-        #                   ...
-        #                  [Dx, Dtheta]_n,
-        #                  [Vx, omega]_0,
-        #                   ...
-        #                  [Vx, omega]_n,}
-
-
-        if self.__n_gapLink == 0 :
-            jac = self._approxJacobian()
-        else :
-            jac = self._approxJacobian
-
-
-        for k, (start_substep, end_substep) in enumerate(zip(steps[:-1],steps[1:]),start=1) :
-            t_substep = t_eval[start_substep:end_substep:]
-            t_span = (t_substep[0], t_substep[-1])
-
-            sol = solve_ivp(self.__IVP_derivativeFunc,
-                            t_span,
-                            Dy0,
-                            method=method,
-                            t_eval=t_substep,
-                            jac=jac,
-                            )
-
-            Dyfixed[:,start_substep:end_substep-1:] = np.array([self._get_refbodies_displacement_state(ti) for ti in t_substep[:-1]]).T
-            Dy[:, start_substep:end_substep-1:] = sol.y[:,:-1]
-
-            Dy0 = sol.y[:,-1]
-            if k == substep :
-                # Dernière itération
-                Dy[:, -1] = Dy0
-                Dyfixed[:, -1] = self._get_refbodies_displacement_state(t_substep[-1])
-
-            print("Step X / N ... blablabla")
-
-        y = self._recompose_body_position(Dy)
-        yfixed = self._recompose_ref_body_position(Dyfixed)
-
-        # Notes :
-        # y << vecteur position corps libres 12 composantes
-        # x position
-        # theta angle d'euler
-        # Vx vitesse
-        # omega vitesse angulaire
-        return y, yfixed, Dy, Dyfixed
-
-
-    def __initialState(self,t_eval):
-        t0 = t_eval[0]
-        # Dy0_fixed = self._get_refbodies_displacement_state(t0)
-
-
-
-        ndof_free = 6 * self.__nbodies
-        ndof_fixed = 6 * self.__nrefbodies
-
-        yref = self._get_bodies_reference_position()
-        yref_fixed = self._get_refbodies_position_state(0)
-        Dy0 = self._get_bodies_initial_displacement()  # vecteur déplacement / vitesse (dX, v, dTheta, omega)
-
-        Uref = np.zeros(6*self.__ntot)
-        Uref[self.__freedof] = yref[:ndof_free]
-        Uref[self.__fixeddof] = yref_fixed[:ndof_fixed]
-
-
-        self.__dUreference = self.__Qmat_linkage @ Uref
-        self.__Freference = (self.__Pmat_linkage @ (self.__Kmat_linkage @ self.__dUreference) ) [self.__freedof]
-        self.__yref = yref[:ndof_free]
-        self.__yref_fixed = yref_fixed[:ndof_fixed]
-
-        return t0, Dy0
-
-    def __IVP_derivativeFunc(self, t, Dy):
-
-        Dyfixed = self._get_refbodies_displacement_state(t)
-
-        # Position des corps fixés dans l'espace
-        Ufixed = Dyfixed[:6 * self.__nrefbodies] + self.__yref_fixed
-        Vfixed = Dyfixed[6 * self.__nrefbodies:]
-
-        # Position des corps libres dans l'espace
-        Uvec = Dy[:6 * self.__nbodies] + self.__yref
-        Vvec = Dy[6 * self.__nbodies:]
-
-
-        # Forces de réaction visco-élastiques linéaires
-        F = self.__Freference - (self.__Kff @ Uvec + self.__Cff @ Vvec + self.__Kb @ Ufixed + self.__Cb @ Vfixed)
-
-        if len(self.__non_linear_link)>0 :
-            dUlocal = self.__Qmat_linkage[:, self.__freedof] @ Uvec + \
-                      self.__Qmat_linkage[:, self.__fixeddof] @ Ufixed - self.__dUreference
-            dVlocal = self.__Qmat_linkage[:, self.__freedof] @ Vvec + \
-                      self.__Qmat_linkage[:, self.__fixeddof] @ Vfixed
-            F += self._nonLinearForces(dUlocal, dVlocal)
-
-
-        if self.__n_gapLink > 0 :
-            F += self._penalizedGapContactReactionForces(Uvec, Vvec, Ufixed, Vfixed)
-
-        acc = self.__invMff @ F + self.__gravity_matrix
-
-
-        return np.concatenate([Vvec, acc])
-
-
-    def _nonLinearForces(self, duLocal,dvLocal):
-        Flocal = np.zeros(self.__nlinks * 6)
-
-        for (link,id_link, si, sj, A1, A2, B1, B2) in self.__non_linear_link:
-            # extraire U1, V1, U2, V2 (local point displacements)
-            s = slice( id_link * 6 , id_link * 6 + 6)
-            # appel à la méthode spécifique de la liaison
-            Flocal[s] = link.GetNonLinearLocalReactions(dUlocal = duLocal[s],
-                                                        dVlocal = dvLocal[s])
-
-        F = self.__Pmat_linkage @ Flocal
-        return F[self.__freedof]
-
-
-    def _penalizedGapContactReactionForces(self, u, v, ub, vb):
-
-
-        du = ((self.__Qgap_f @ u + self.__Qgap_b @ ub) - self.__dUreference[self.__local_gap_index])
-
-        dv = (self.__Qgap_f @ v + self.__Qgap_b @ vb)
-        du_viol = np.maximum(0., du - self.__gapPlus) +\
-                  np.minimum(0., du - self.__gapMinus)
-        dv_viol = dv * (np.abs(du_viol) > 0.)
-
-        F = -self.__Pgap_f @ (self.__Kmat_gap @ du_viol + self.__Cmat_gap @ dv_viol)
-
-        return F
-
-
-
-    def _approxJacobian(self, t=None, Dy=None):
-        if self.__Jac_linear is None :
-            n = 6 * self.__nbodies
-            A = np.zeros((2 * n, 2 * n))
-            A[:n, n:] = np.eye(n)
-            A[n:, :n] = -self.__invMff @ self.__Kff
-            A[n:, n:] = -self.__invMff @ self.__Cff
-            self.__Jac_linear = csc_matrix(A)
-
-        if self.__n_gapLink == 0 :
-            return self.__Jac_linear
-
-        n = 6 * self.__nbodies
-        u = Dy[:n] + self.__yref
-
-        Dyref = self._get_refbodies_displacement_state(t)
-        ub = Dyref[:6 * self.__nrefbodies] + self.__yref_fixed
-
-        du = (self.__Qgap_f @ u + self.__Qgap_b @ ub) - self.__dUreference[self.__local_gap_index]
-
-        phi0 = np.maximum(0, du - self.__gapPlus) + np.minimum(0, du - self.__gapMinus)
-        s_phi = 1.0 * (phi0 > 0) + 1.0 * (phi0 < 0)
-        Pf = (self.__Pgap_f * s_phi[np.newaxis])
-
-        Agap_penal = np.zeros((2 * n, 2 * n))
-        Agap_penal[n:, :n] = -self.__invMff @ (Pf @ ((self.__Kmat_gap @ self.__Qgap_f)))
-        Agap_penal[n:, n:] = -self.__invMff @ (Pf @ ((self.__Cmat_gap @ self.__Qgap_f)))
-        Agap_penal = csc_matrix(Agap_penal)
-        return Agap_penal + self.__Jac_linear
-
 

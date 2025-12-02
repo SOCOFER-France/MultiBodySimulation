@@ -61,11 +61,11 @@ t_scipy = sol.t
 from MultiBodySimulation.MBSBody import MBSRigidBody3D,MBSReferenceBody3D
 from MultiBodySimulation.MBSMechanicalJoint import (MBSLinkLinearSpringDamper,
                                                 MBSLinkHardStop)
-from MultiBodySimulation.MBSMechanicalSystem import MBSMechanicalSystem3D
+from MultiBodySimulation.MBSMechanicalSystem import MBSLinearSystem
 
 
 # Création du système
-mecha_sys = MBSMechanicalSystem3D()
+mecha_sys = MBSLinearSystem()
 mecha_sys.gravity = np.array([0., 0., 0.])  # pas de gravité
 
 # Corps
