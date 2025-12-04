@@ -7,7 +7,9 @@ import warnings
 
 from MultiBodySimulation.MBSMechanicalJoint import _MBSLink3D
 from MultiBodySimulation.MBSBody import MBSRigidBody3D, MBSReferenceBody3D
-from MultiBodySimulation.MBSSimulationResults import MBSBodySimulationResult, MBSModalResults
+from MultiBodySimulation.MBSSimulationResults import (MBSBodySimulationResult,
+                                                      MBSModalResults,
+                                                      MBSFrequencyDomainResult)
 
 
 
@@ -957,3 +959,258 @@ class MBSLinearSystem(__MBSBase):
 
 
 
+    def ComputeFrequencyDomainResponse(self,input_output : List,
+                                            frequency_array : np.array = None,
+                                            fstart = None , fend = None,
+                                            print_damping = True,
+                                            nbase=20):
+        """
+        Calcule la réponse fréquentielle du système par projection modale.
+
+        Cette méthode résout le système dans le domaine fréquentiel en utilisant
+        les modes propres comme base de réduction. Pour chaque fréquence ω, on calcule
+        les fonctions de transfert G(ω) = X(ω)/Xb(ω) pour les paires entrée-sortie
+        spécifiées.
+
+        Système résolu : (Kff + jω*Cff - ω²*Mff) X = (Kb + jω*Cb) Xb
+        Projection modale : X ≈ Φ·q où q vérifie le système diagonal réduit.
+
+        Parameters
+        ----------
+        input_output : List[Tuple[str, int, str, int]]
+            Liste des paires (entrée, sortie) à analyser. Chaque tuple contient :
+            - body1 (str) : nom du corps de référence (excitation)
+            - axe1 (int) : indice d'axe d'excitation (0-5 pour x,y,z,θx,θy,θz)
+            - body2 (str) : nom du corps libre (réponse)
+            - axe2 (int) : indice d'axe de réponse (0-5)
+            Exemple : [("Base", 1, "Mass1", 1)] pour y_Mass1 / y_Base
+
+        frequency_array : np.array, optional
+            Vecteur de fréquences [Hz] pour l'analyse. Si None, généré automatiquement.
+
+        fstart : float, optional
+            Fréquence de début [Hz] si frequency_array n'est pas fourni.
+            Par défaut : 0.5 * f₁ (moitié de la première fréquence propre).
+
+        fend : float, optional
+            Fréquence de fin [Hz] si frequency_array n'est pas fourni.
+            Par défaut : 2.0 * fₙ (double de la dernière fréquence propre).
+
+        print_damping : bool, optional (default=True)
+            Affiche les taux d'amortissement modaux si la matrice d'amortissement
+            est diagonale dans la base modale.
+
+        nbase : int, optional (default=20)
+            Nombre de points par décade pour l'échantillonnage logarithmique
+            automatique des fréquences.
+
+        Returns
+        -------
+        MBSFrequencyDomainResult
+            Objet contenant :
+            - frequency_array : vecteur de fréquences [Hz]
+            - transfer_function_array : fonctions de transfert complexes G(ω)
+            - input_output_list : liste des paires analysées
+            - natural_pulsations : pulsations propres ωᵢ [rad/s]
+            - damping_factor : taux d'amortissement modaux ξᵢ (si diagonal)
+
+        Raises
+        ------
+        ValueError
+            - Si le système n'est pas totalement linéaire
+            - Si frequency_array contient des valeurs négatives ou nulles
+            - Si fstart ≤ 0 ou fend ≤ fstart
+            - Si input_output contient des corps ou axes invalides
+
+        Notes
+        -----
+        - La méthode utilise la projection modale pour réduire drastiquement le coût
+          de calcul (facteur ~n²/m où n=DDL totaux, m=nombre de modes).
+        - L'amortissement modal est automatiquement détecté : si C_modal est diagonal,
+          les taux ξᵢ sont calculés. Sinon, la matrice pleine est conservée.
+        - Les DDL sans rigidité ni amortissement sont automatiquement filtrés.
+
+        Examples
+        --------
+        >>> # Analyse FRF entre excitation verticale de la base et réponse d'une masse
+        >>> input_output = [("Base", 1, "Mass1", 1)]  # y/y
+        >>> result = system.ComputeFrequencyDomainResponse(input_output, fstart=1, fend=100)
+        >>>
+        >>> # Extraire la FRF
+        >>> tf = result.SelectTransferFunctionObject_byLocId(0)
+        >>> import matplotlib.pyplot as plt
+        >>> plt.loglog(tf.frequency, tf.module)
+
+        See Also
+        --------
+        MBSFrequencyDomainResult : Structure de retour avec méthodes d'extraction
+        ComputeModalAnalysis : Calcul préalable des modes propres
+        """
+
+        if not self._assembled :
+            self.AssemblyMatrixSystem()
+
+        if not self._check_linearity() :
+            raise ValueError("Le système n'est pas totalement linéaire. "
+                             "Le système comporte des liaisons non linéaires ou "
+                             "des liaisons de contact avec jeu. "
+                             "L'analyse modale n'est pas possible.")
+
+
+        filtered_rows = ~ np.all((self._Kff == 0) & (self._Cff == 0), axis=0)
+        K = self._Kff[filtered_rows][:, filtered_rows]
+        C = self._Cff[filtered_rows][:, filtered_rows]
+        M = self._Mff[filtered_rows][:, filtered_rows]
+
+
+        all_indexes = np.array(list(range(self._nbodies * 6)), dtype=int)
+        selected_indexes = all_indexes[filtered_rows]
+        full_index_to_reduced = {j : i for i,j in enumerate(selected_indexes) }
+
+        filtered_reference_cols = ~ np.all((self._Kb == 0) & (self._Cb == 0), axis=0)
+        Kb = self._Kb[filtered_rows][:, filtered_reference_cols]
+        Cb = self._Cb[filtered_rows][:, filtered_reference_cols]
+
+        all_reference_indexes = np.array(list(range(self._nrefbodies * 6)), dtype=int)
+        selected_reference_indexes = all_reference_indexes[filtered_reference_cols]
+        full_reference_index_to_reduced = {j: i for i, j in enumerate(selected_reference_indexes)}
+
+
+        lambda_, phi = eigh(K, M)
+        lambda_ = self.__checkEigVals(lambda_)
+
+        # Normalisation  de phi_ pour obtenir
+        # phi_.T @ Mf @ phi_ = Identité
+        # phi_.T @ Kf @ phi_ = lambda_
+        modal_mass = np.diag(phi.T @ M @ phi)
+        phi = phi @ np.diag(1 / np.sqrt(modal_mass))
+
+        # Pulsations propres
+        omega_0 = np.sqrt(lambda_)
+
+        # Sous-espace propre
+        Cb_phi = phi.T @ Cb
+        Kb_phi = phi.T @ Kb
+        Cphi = phi.T @ C @ phi
+
+        diag_damping = np.isclose(Cphi, np.diag(np.diag(Cphi))).all()
+
+        xi = None
+        if diag_damping :
+            # ξ ==> 2*ξ*omega_0 = diag(Cphi)
+            xi = np.diag(Cphi) / (2*omega_0)
+
+            if print_damping :
+                print("=" * 40)
+                print("Damping factors")
+                for wi, ci in zip(omega_0, xi) :
+                    print(f"ω0 = {wi:.4e} rad/s | ξ = {ci:.4e}")
+
+        # Validation de la structure input_output
+        if not isinstance(input_output, list) or len(input_output) == 0:
+            raise ValueError("'input_output' doit être une liste non vide de tuples "
+                             "(body_ref, axe_ref, body_free, axe_free).")
+
+        seen_pairs = set()
+        index_rows = []
+        index_cols = []
+
+        for item in input_output:
+            # Vérification de la structure
+            if not isinstance(item, (tuple, list)) or len(item) != 4:
+                raise ValueError(f"Chaque élément de 'input_output' doit contenir 4 éléments "
+                                 f"[str, int, str, int]. Reçu : {item}")
+
+            body1, axe1, body2, axe2 = item
+
+            # Vérification des types
+            if not isinstance(body1, str) or not isinstance(body2, str):
+                raise TypeError(f"Les noms de corps doivent être des chaînes. "
+                                f"Reçu : body1={type(body1)}, body2={type(body2)}")
+
+            if not isinstance(axe1, int) or not isinstance(axe2, int):
+                raise TypeError(f"Les indices d'axes doivent être des entiers. "
+                                f"Reçu : axe1={type(axe1)}, axe2={type(axe2)}")
+
+            # Vérification des plages d'axes
+            if not (0 <= axe1 <= 5):
+                raise ValueError(f"L'indice d'axe d'excitation doit être entre 0 et 5. "
+                                 f"Reçu : axe1={axe1} pour {body1}")
+
+            if not (0 <= axe2 <= 5):
+                raise ValueError(f"L'indice d'axe de réponse doit être entre 0 et 5. "
+                                 f"Reçu : axe2={axe2} pour {body2}")
+
+            # 1 - Vérifier que body1 est un corps de référence
+            if body1 not in self.ref_body_index:
+                raise ValueError(f"'{body1}' n'est pas un corps de référence (excitation). "
+                                 f"Corps de référence disponibles : {list(self.ref_body_index.keys())}")
+
+            # 3 - Vérifier que body2 est un corps libre
+            if body2 not in self.body_index:
+                raise ValueError(f"'{body2}' n'est pas un corps libre (réponse). "
+                                 f"Corps libres disponibles : {list(self.body_index.keys())}")
+
+            id_ref = self.ref_body_index[body1]
+            id_body = self.body_index[body2]
+
+            index_ref = id_ref * 6 + axe1
+            index_body = id_body * 6 + axe2
+
+            # 2 - Vérifier que l'axe d'excitation est disponible (non nul dans Kb ou Cb)
+            if index_ref not in selected_reference_indexes:
+                axe_names = ["x", "y", "z", "θx", "θy", "θz"]
+                raise ValueError(f"L'axe {axe_names[axe1]} du corps '{body1}' n'a pas "
+                                 f"de couplage d'excitation (colonnes Kb et Cb nulles).")
+
+            # 4 - Vérifier que l'axe de réponse est disponible (non nul dans Kff ou Cff)
+            if index_body not in selected_indexes:
+                axe_names = ["x", "y", "z", "θx", "θy", "θz"]
+                raise ValueError(f"L'axe {axe_names[axe2]} du corps '{body2}' n'a pas "
+                                 f"de dynamique (lignes Kff et Cff nulles).")
+
+            # 5 - Vérifier qu'il n'y a pas de duplication
+            pair_signature = (body1, axe1, body2, axe2)
+            if pair_signature in seen_pairs:
+                raise ValueError(f"Paire dupliquée détectée : {pair_signature}")
+            seen_pairs.add(pair_signature)
+
+            # Enregistrement des indices réduits
+            index_cols.append(full_reference_index_to_reduced[index_ref])
+            index_rows.append(full_index_to_reduced[index_body])
+
+
+
+        if frequency_array is not None :
+            if not np.all( frequency_array > 0 ) :
+                raise ValueError("'frequency_array' must be positive")
+        elif (fstart is not None and fend is not None) :
+            if not fstart >0 : raise ValueError("'fstart' must be positive")
+            if not fend > fstart : raise ValueError("'fend' must be greater than 'fstart'")
+            npoints = int(nbase * fend / fstart)
+            frequency_array = np.logspace(np.log10(fstart), np.log10(fend), npoints)
+        else :
+            fstart = 0.5 * omega_0.min() / (2 * np.pi)
+            fend = 2.0 * omega_0.max() / (2 * np.pi)
+            npoints = int(nbase * fend / fstart)
+            frequency_array = np.logspace(np.log10(fstart), np.log10(fend), npoints)
+
+
+        Gi_array = []
+        for i, wi in enumerate(frequency_array * 2 * np.pi) :
+            if diag_damping :
+                Hinv = np.diag(1/(omega_0**2 + 1j*wi*2*xi*omega_0 - wi**2))
+            else :
+                H = np.diag(omega_0**2 - wi**2) + 1j*wi*Cphi
+                Hinv = np.linalg.inv(H)
+
+            Gqi = Hinv @ (Kb_phi + 1j * wi * Cb_phi)
+            Gi = phi @ Gqi
+
+            Gi_array.append( Gi[index_rows,index_cols] )
+        Gi_array = np.array(Gi_array)
+        return MBSFrequencyDomainResult(frequency_array,
+                                        Gi_array,
+                                        input_output,
+                                        omega_0,
+                                        xi)

@@ -8,9 +8,9 @@ J3 = 0.5
 kt1 = 10.0
 kt2 = 10.0
 kt3 = 4.0
-ct1 = kt1 * 8/100
-ct2 = kt2 * 8/100
-ct3 = kt3 * 8/100
+ct1 = kt1 * 20/100
+ct2 = kt2 * 5/100
+ct3 = kt3 * 5/100
 
 t_span = [0, 30]
 t_eval = np.linspace(t_span[0], t_span[1], 1000)
@@ -132,6 +132,15 @@ mbs_modal_result = mecha_sys.ComputeModalAnalysis(sort_values = True,
 modal_result_dict = mbs_modal_result.GetDisplacementsByBodies()
 freq_vector_mbs = mbs_modal_result.GetNaturalFrequencies()
 
+
+freqres = mecha_sys.ComputeFrequencyDomainResponse([
+            ("Ref", 3, "Masse 1", 3),
+            ("Ref", 3, "Masse 2", 3),
+            ("Ref", 3, "Masse 3", 3)
+                        ])
+
+G = freqres.SelectTransferFunctionObject_byLocId(None)
+
 print("=" * 40)
 print()
 ## Affichage des modes propres
@@ -156,7 +165,28 @@ ax.set(title="Déplacements des modes propres",
        xlabel = "Fréquence [Hz]",
        ylabel = "Angle [°]")
 
+plt.figure(figsize=(7,8))
+plt.subplot(311)
+plt.loglog(G.frequency, G.module, label = G.names)
+for w0 in freqres.GetNaturalFrequencies() :
+    plt.axvline(w0, color = "grey")
+plt.legend()
+plt.grid(True)
 
+plt.subplot(312)
+plt.semilogx(G.frequency, G.phase, label = G.names)
+for w0 in freqres.GetNaturalFrequencies() :
+    plt.axvline(w0, color = "grey")
+plt.legend()
+plt.grid(True)
 
+plt.subplot(313)
+plt.loglog(G.frequency, G.powerSpectralDensity, label = G.names)
+for w0 in freqres.GetNaturalFrequencies() :
+    plt.axvline(w0, color = "grey")
+plt.legend()
+plt.grid(True)
+
+plt.tight_layout()
 plt.show()
 
