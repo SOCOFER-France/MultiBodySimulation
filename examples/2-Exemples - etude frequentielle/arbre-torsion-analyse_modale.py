@@ -61,7 +61,8 @@ for f in np.sort(natural_freq_theorique) :
 import sys,socofer
 sys.path.append(socofer.devpy_ala_path)
 from MultiBodySimulation.MBSBody import MBSRigidBody3D,MBSReferenceBody3D
-from MultiBodySimulation.MBSMechanicalJoint import MBSLinkLinearSpringDamper
+from MultiBodySimulation.MBSMechanicalJoint import (MBSLinkLinearSpringDamper,
+MBSLinkKinematic)
 from MultiBodySimulation.MBSMechanicalSystem import MBSLinearSystem
 
 mecha_sys = MBSLinearSystem()
@@ -136,7 +137,7 @@ freq_vector_mbs = mbs_modal_result.GetNaturalFrequencies()
 freqres = mecha_sys.ComputeFrequencyDomainResponse([
             ("Ref", 3, "Masse 1", 3),
             ("Ref", 3, "Masse 2", 3),
-            ("Ref", 3, "Masse 3", 3)
+            ("Ref", 3, "Masse 3", 3),
                         ])
 
 G = freqres.SelectTransferFunctionObject_byLocId(None)

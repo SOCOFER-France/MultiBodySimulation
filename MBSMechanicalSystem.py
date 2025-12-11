@@ -3,6 +3,7 @@ from typing import Dict, List, Optional
 from scipy.sparse import csc_matrix
 from scipy.integrate import solve_ivp
 from scipy.linalg import eigvalsh, eigh
+from scipy.linalg import qr as QR_decomposition
 import warnings
 
 from MultiBodySimulation.MBSMechanicalJoint import _MBSLink3D
@@ -205,6 +206,11 @@ class MBSLinearSystem(__MBSBase):
 
         self.__max_angle_threshold: Optional[float] = None
 
+        self.__T_qr = None
+        self.__qr_salve_indices =  None
+        self.__qr_master_indices = None
+        self.__qr_unconstrained_indices = None
+
     def _block_slice(self, body_idx: int) -> slice:
         """Renvoie le slice pour le bloc 6×6 du corps i dans les matrices globales."""
         s = 6 * body_idx
@@ -249,10 +255,12 @@ class MBSLinearSystem(__MBSBase):
         self._Pmat_linkage = np.zeros((6 * nbodies, 6 * self._nlinks))
         self._Kmat_linkage = np.zeros((6 * self._nlinks, 6 * self._nlinks))
         self._Cmat_linkage = np.zeros((6 * self._nlinks, 6 * self._nlinks))
+        self._Kmat_kinematic = np.zeros((6 * self._nlinks, 6 * self._nlinks))
 
         # Cataloguer les liaisons par type
         self._non_linear_link = []
         self._linear_link = []
+        self.__n_kinematic_links = 0
 
         # Liaisons avec gap (butées)
         ngap = len([link for link in self.links if link.HasGap])
@@ -336,6 +344,7 @@ class MBSLinearSystem(__MBSBase):
                 Cloc = np.zeros((6, 6))
                 id_gap += 1
 
+
             # Assemblage dans les matrices de liaison globales
             s_linkage = slice(id_link * 6, id_link * 6 + 6)
 
@@ -350,6 +359,12 @@ class MBSLinearSystem(__MBSBase):
             # K, C locales
             self._Kmat_linkage[s_linkage, s_linkage] += Kloc
             self._Cmat_linkage[s_linkage, s_linkage] += Cloc
+
+            if link.IsKinematic :
+                self.__n_kinematic_links += 1
+                self._Kmat_kinematic[s_linkage, s_linkage] += link.GetConstraintMatrix()
+                # GetConstrainMatrix >> diagonal avec 1 si dll local bloqué
+
 
         # Matrices de gap (filtrer les gaps infinis)
         keepgap = (~np.isinf(stop_delta_plus)) & (~np.isinf(stop_delta_minus))
@@ -849,8 +864,489 @@ class MBSLinearSystem(__MBSBase):
         lambda_ = np.maximum(lambda_, 0.0)
         return lambda_
 
+    def ComputeQrDecomposedSystem(self, print_infos=False,
+                                  print_slaves_dof=False,
+                                  rtol=None,
+                                  drop_unconstrained_rows=True):
+        """
+        Décompose le système en identifiant les degrés de liberté maîtres et esclaves.
 
-    def CheckUnconstrainedDegreeOfFreedom(self):
+        Cette méthode utilise une décomposition QR avec pivotage pour détecter automatiquement
+        les dépendances cinématiques dans le système (liaisons rigidifiées par pénalisation).
+        Les DDL esclaves sont exprimés comme combinaisons linéaires des DDL maîtres, permettant
+        une condensation du système qui élimine les modes parasites à haute fréquence.
+
+        Contexte d'utilisation
+        ----------------------
+        Lorsqu'un système multi-corps contient des liaisons cinématiques rigidifiées par
+        pénalisation (raideur k → ∞), la matrice de raideur K devient singulière ou très
+        mal conditionnée. Cela génère :
+
+        - Des valeurs propres négatives parasites (∼-1e-5)
+        - Des fréquences propres irréalistes (>1e4 Hz)
+        - Des instabilités numériques en simulation
+
+        La décomposition QR identifie ces dépendances et construit une base réduite où
+        seuls les DDL indépendants (maîtres) sont conservés.
+
+        Principe mathématique
+        ---------------------
+        1. Extraction de K_cinematique (raideurs de pénalisation uniquement)
+        2. Décomposition QR : K @ P = Q @ R avec pivotage
+        3. Détection du rang numérique de R
+        4. Construction de la relation x_slave = B @ x_master
+        5. Assemblage de T_qr : x_freedof = T_qr @ x_master
+
+        Classification des DDL
+        ----------------------
+        - **DDL totalement libres** : Aucune contrainte (K = 0, C = 0)
+        - **DDL élastiques purs** : Contraints uniquement par ressorts (pas de contraintes cinématiques)
+        - **DDL maîtres QR** : DDL indépendants dans les contraintes cinématiques
+        - **DDL esclaves QR** : Déterminés algébriquement par les maîtres
+
+        Parameters
+        ----------
+        print_infos : bool, optional
+            Affiche un rapport détaillé de la décomposition incluant :
+            - Nombre de DDL par catégorie
+            - Rang numérique et conditionnement des matrices
+            - Tests de validation de la décomposition
+            - Avertissements si problèmes détectés
+            Par défaut : False
+
+        print_slaves_dof : bool, optional
+            Affiche la liste complète des DDL esclaves identifiés.
+            Utile pour comprendre quels DDL sont déterminés par d'autres.
+            Par défaut : False
+
+        rtol : float, optional
+            Tolérance relative pour la détection du rang numérique.
+            Si spécifiée : tolerance = rtol × σ_max
+            Si None : tolerance automatique = σ_max × √ε × max(dimensions)
+            où σ_max est la plus grande valeur singulière et ε la précision machine.
+            Recommandé : laisser None (détection automatique).
+            Par défaut : None
+
+        drop_unconstrained_rows : bool, optional
+            Si True, les DDL totalement libres (non contraints) sont automatiquement
+            exclus de l'analyse et du système condensé.
+            Si False, tous les DDL sont conservés (déconseillé).
+            Par défaut : True
+
+        Raises
+        ------
+        ValueError
+            - Si le système n'est pas assemblé
+            - Si le système contient des liaisons non linéaires ou avec jeu
+            - Si le système n'a pas de liaisons cinématiques
+
+        Warnings
+        --------
+        UserWarning
+            - Si aucun DDL esclave n'est détecté (pas de dépendances cinématiques)
+            - Si le conditionnement de K_condensed est très élevé (>1e12)
+            - Si des DDL esclaves ne sont pas correctement éliminés (résidu >1e-6)
+            - Si la cohérence énergétique n'est pas vérifiée
+
+        Attributes modifiés
+        -------------------
+        self.__T_qr : ndarray, shape (n_freedof, n_masters)
+            Matrice de transformation entre espace maître et espace freedof complet.
+            Vérifie : x_freedof = T_qr @ x_masters
+
+        self.__qr_master_indices : ndarray, shape (n_masters,)
+            Indices globaux des DDL maîtres dans l'espace freedof.
+            Inclut : DDL élastiques + DDL maîtres QR
+
+        self.__qr_slave_indices : ndarray, shape (n_slaves,)
+            Indices globaux des DDL esclaves dans l'espace freedof.
+            Inclut : DDL totalement libres + DDL esclaves QR
+
+        self.__qr_unconstrained_indices : ndarray, shape (n_unconstrained,)
+            Indices globaux des DDL totalement libres (sous-ensemble des esclaves).
+
+        Notes
+        -----
+        - La décomposition QR est particulièrement efficace pour les systèmes avec
+          des liaisons pivot, glissières ou sphériques rigidifiées par pénalisation.
+
+        - Le conditionnement de K_condensed devrait être significativement amélioré
+          par rapport à K_original (typiquement facteur 1e5 à 1e10).
+
+        - Les DDL esclaves peuvent toujours être reconstruits via T_qr pour les analyses
+          post-traitement (visualisation, extraction de résultats).
+
+        - Cette méthode doit être appelée avant ComputeModalAnalysis ou
+          ComputeFrequencyDomainResponse pour bénéficier de la condensation.
+
+        Examples
+        --------
+        >>> # Cas d'usage typique
+        >>> system = MBSLinearSystem()
+        >>> # ... ajout des corps et liaisons ...
+        >>> system.AssemblyMatrixSystem()
+        >>>
+        >>> # Décomposition avec rapport détaillé
+        >>> system.ComputeQrDecomposedSystem(print_infos=True, print_slaves_dof=True)
+        >>>
+        >>> # Analyse modale avec condensation automatique
+        >>> modal_results = system.ComputeModalAnalysis()
+        >>>
+        >>> # Les fréquences parasites ont disparu
+        >>> frequencies = modal_results.GetNaturalFrequencies()
+
+        See Also
+        --------
+        ComputeModalAnalysis : Analyse modale utilisant automatiquement la condensation QR
+        ComputeFrequencyDomainResponse : Réponse fréquentielle avec condensation QR
+        CheckUnconstrainedDegreeOfFreedom : Identification des DDL totalement libres
+        """
+        if not self._assembled:
+            self.AssemblyMatrixSystem()
+
+        if not self._check_linearity():
+            raise ValueError("Le système n'est pas totalement linéaire. "
+                             "Le système comporte des liaisons non linéaires ou "
+                             "des liaisons de contact avec jeu. "
+                             "L'analyse des degrés de liberté sur-contraints risque d'être faussée")
+
+        if self.__n_kinematic_links == 0:
+            raise ValueError("Le système n'a pas de liaisons cinématiques. "
+                             "Pas de décomposition QR nécessaire")
+
+        ndof_total = 6 * self._nbodies
+        all_indices = np.arange(ndof_total)
+        dll_vec = np.array(
+            [f"{body.GetName} - {dof}"
+             for body in self.bodies
+             for dof in ["x", "y", "z", "rx", "ry", "rz"]]
+        )
+
+        # ===================================================================
+        # ÉTAPE 1 : Identification des DLL totalement non contraints
+        # ===================================================================
+        if drop_unconstrained_rows:
+            unconstrained_mask = np.isclose(self._Kff, 0).all(axis=0)
+        else:
+            unconstrained_mask = np.full(ndof_total, False, dtype=bool)
+
+        unconstrained_indices = all_indices[unconstrained_mask]
+
+        # ===================================================================
+        # ÉTAPE 2 : Matrice de raideur purement cinématique
+        # ===================================================================
+        Kf_cinematique = (self._Pmat_linkage @ self._Kmat_kinematic @ self._Qmat_linkage)[self._freedof][:,
+                         self._freedof]
+
+        # ===================================================================
+        # ÉTAPE 3 : Identification des DLL contraints uniquement par élasticité
+        # ===================================================================
+        elastic_only_mask = (~unconstrained_mask) & np.all(Kf_cinematique == 0, axis=0)
+        elastic_only_indices = all_indices[elastic_only_mask]
+
+        # ===================================================================
+        # ÉTAPE 4 : DLL concernés par la décomposition QR
+        # ===================================================================
+        kinematic_constrained_mask = (~unconstrained_mask) & (~elastic_only_mask)
+        kinematic_constrained_indices = all_indices[kinematic_constrained_mask]
+        Kf_to_decompose = Kf_cinematique[kinematic_constrained_mask][:, kinematic_constrained_mask]
+        ndof_qr = len(kinematic_constrained_indices)
+
+        # ===================================================================
+        # ÉTAPE 5 : Décomposition QR avec pivotage
+        # ===================================================================
+        Q, R, P = QR_decomposition(Kf_to_decompose, mode='economic', pivoting=True)
+
+        # Détermination du rang avec SVD (plus robuste que diag(R))
+        svd = np.linalg.svd(Kf_to_decompose, compute_uv=False)
+
+        if rtol is not None:
+            tolerance = rtol * svd.max()
+        else:
+            eps = np.finfo(float).eps
+            tolerance = svd.max() * np.sqrt(eps) * max(Kf_to_decompose.shape)
+
+        rank = np.sum(svd > tolerance)
+        nslaves_qr = ndof_qr - rank
+
+        # Conditionnement
+        cond_K_cinematique = svd.max() / svd[svd > tolerance].min() if rank > 0 else np.inf
+
+        if print_infos:
+            print("=" * 70)
+            print("DÉCOMPOSITION QR - IDENTIFICATION MAÎTRES/ESCLAVES")
+            print("=" * 70)
+            print(f"\n STRUCTURE DU SYSTÈME")
+            print(f"  Degrés de liberté total               : {ndof_total}")
+            print(f"  ├─ DDL totalement libres              : {len(unconstrained_indices)}")
+            print(f"  ├─ DDL élastiques purs                : {len(elastic_only_indices)}")
+            print(f"  └─ DDL avec contraintes cinématiques  : {ndof_qr}")
+            print(f"      ├─ DDL maîtres QR                 : {rank}")
+            print(f"      └─ DDL esclaves QR                : {nslaves_qr}")
+
+            print(f"\n ANALYSE NUMÉRIQUE")
+            print(f"  Conditionnement K_cinematique         : {cond_K_cinematique:.2e}")
+
+            # Classification du conditionnement
+            if cond_K_cinematique < 1e6:
+                cond_status = " Excellent"
+            elif cond_K_cinematique < 1e10:
+                cond_status = " Acceptable"
+            elif cond_K_cinematique < 1e15:
+                cond_status = "️ Mal conditionné"
+            else:
+                cond_status = " Très mal conditionné"
+            print(f"  Statut                                : {cond_status}")
+
+            print(f"  Tolérance SVD appliquée               : {tolerance:.2e}")
+            print(f"  Valeur singulière max                 : {svd.max():.2e}")
+            print(f"  Valeur singulière min (>tol)          : {svd[svd > tolerance].min():.2e}")
+
+            # Distribution des valeurs singulières
+            print(f"\n  Distribution des valeurs singulières :")
+            thresholds = [1e-2, 1e-4, 1e-6, 1e-8, 1e-10, 1e-12]
+            for thresh in thresholds:
+                n_above = np.sum(svd > svd.max() * thresh)
+                if n_above != ndof_qr:
+                    print(f"    > {thresh:.0e} × σ_max : {n_above}/{ndof_qr}")
+
+        # ===================================================================
+        # ÉTAPE 6 : Construction de la matrice de couplage B
+        # ===================================================================
+        R_mm = R[:rank, :rank]
+        R_ms = R[:rank, rank:]
+
+        if nslaves_qr > 0:
+            B, _, _, _ = np.linalg.lstsq(R_ms, -R_mm, rcond=None)
+            # Méthode 1 : Pseudo-inverse (plus robuste)
+            from scipy.linalg import pinv
+
+            # On veut résoudre : R_ms @ B = -R_mm
+            # Solution aux moindres carrés : B = pinv(R_ms) @ (-R_mm)
+            # R_ms_pinv = pinv(R_ms)
+            # B = R_ms_pinv @ (-R_mm)
+
+            residual_matrix = R_ms @ B + R_mm
+            residual_norm = np.linalg.norm(residual_matrix)
+            residual_relative = residual_norm / np.linalg.norm(R_mm)
+
+            if print_infos:
+                print(f"\n CONSTRUCTION DE LA MATRICE DE COUPLAGE B")
+                print(f"  Dimensions B                          : {B.shape}")
+                print(f"  Résidu ||R_ms @ B + R_mm||            : {residual_norm:.2e}")
+                print(f"  Résidu relatif                        : {residual_relative:.2e}")
+                print(f"  Norme de B                            : {np.linalg.norm(B):.2e}")
+
+                if residual_relative > 1e-6:
+                    print(f"  Résidu élevé - vérifier le conditionnement")
+
+                    # Analyser les contraintes quasi-dépendantes
+                    print(f"\n  ANALYSE DES CONTRAINTES REDONDANTES")
+
+                    # Identifier les paires de lignes presque colinéaires dans Kf_to_decompose
+                    from scipy.spatial.distance import pdist, squareform
+
+                    # Normaliser les lignes
+                    K_rows_norm = Kf_to_decompose / (np.linalg.norm(Kf_to_decompose, axis=1, keepdims=True) + 1e-16)
+
+                    # Calculer la similarité (produit scalaire)
+                    similarity = K_rows_norm @ K_rows_norm.T
+                    np.fill_diagonal(similarity, 0)
+
+                    # Trouver les paires très similaires (>0.99)
+                    redundant_pairs = np.argwhere(similarity > 0.99)
+
+                    if len(redundant_pairs) > 0:
+                        print(f"    {len(redundant_pairs)} paires de contraintes redondantes détectées")
+                        print(f"    Cela indique probablement :")
+                        print(f"      - Des liaisons cinématiques en série mal définies")
+                        print(f"      - Des contraintes contradictoires")
+                        print(f"      - Une boucle fermée avec dépendances")
+
+                        # Afficher quelques exemples
+                        dll_vec_qr = dll_vec[kinematic_constrained_indices]
+                        for i, j in redundant_pairs[:5]:
+                            if i < j:  # Éviter doublons
+                                print(f"      DDL {dll_vec_qr[i]} ≈ DDL {dll_vec_qr[j]} (sim={similarity[i, j]:.4f})")
+                    else:
+                        print(f"    Aucune contrainte redondante évidente détectée")
+                        print(f"    Le mauvais conditionnement vient probablement de :")
+                        print(f"      - Très grandes différences d'échelle dans les raideurs")
+                        print(f"      - Contraintes numériquement instables")
+        else:
+            B = np.zeros((0, rank))
+            self.__T_qr = np.eye(ndof_total)
+            self.__qr_slave_indices = np.array([], dtype=int)
+            self.__qr_master_indices = all_indices
+            self.__qr_unconstrained_indices = unconstrained_indices
+            warnings.warn("Aucun DDL esclave détecté par QR. Système déjà de rang plein.")
+            return
+
+        # ===================================================================
+        # ÉTAPE 7-9 : Construction de T_qr globale
+        # ===================================================================
+        T_c_local = np.zeros((ndof_qr, rank))
+        T_c_local[:rank, :] = np.eye(rank)
+        T_c_local[rank:, :] = B
+
+        T_c_full = np.zeros((ndof_qr, rank))
+        T_c_full[P, :] = T_c_local
+
+        master_indices_qr_perm = np.arange(rank)
+        slave_indices_qr_perm = np.arange(rank, ndof_qr)
+        master_indices_qr_orig = P[master_indices_qr_perm]
+        slave_indices_qr_orig = P[slave_indices_qr_perm]
+        qr_master_indices_global = kinematic_constrained_indices[master_indices_qr_orig]
+        qr_slave_indices_global = kinematic_constrained_indices[slave_indices_qr_orig]
+
+        n_elastic = len(elastic_only_indices)
+        nmaster_global = rank + n_elastic
+
+        T_qr = np.zeros((ndof_total, nmaster_global))
+        T_qr[np.ix_(kinematic_constrained_indices, np.arange(rank))] = T_c_full
+        T_qr[np.ix_(elastic_only_indices, rank + np.arange(n_elastic))] = np.eye(n_elastic)
+
+        # ===================================================================
+        # ÉTAPE 10 : Stockage
+        # ===================================================================
+        self.__T_qr = T_qr
+        master_indices_global = np.concatenate([elastic_only_indices, qr_master_indices_global])
+        slave_indices_global = np.concatenate([unconstrained_indices, qr_slave_indices_global])
+        self.__qr_slave_indices = slave_indices_global
+        self.__qr_master_indices = master_indices_global
+        self.__qr_unconstrained_indices = unconstrained_indices
+
+        # ===================================================================
+        # ÉTAPE 11 : Vérifications et diagnostics
+        # ===================================================================
+        if print_infos:
+            print(f"\nRÉSULTATS DE LA CONDENSATION")
+            print(f"  DDL maîtres totaux                    : {nmaster_global}")
+            print(f"    ├─ Élastiques                       : {n_elastic}")
+            print(f"    └─ Maîtres QR                       : {rank}")
+            print(f"  DDL esclaves totaux                   : {len(slave_indices_global)}")
+            print(f"    ├─ Totalement libres                : {len(unconstrained_indices)}")
+            print(f"    └─ Esclaves QR                      : {nslaves_qr}")
+
+            # Test 1 : Rang des matrices
+            K_condensed = T_qr.T @ self._Kff @ T_qr
+            rank_kff_original = np.linalg.matrix_rank(self._Kff, tol=1e-10)
+            rank_condensed = np.linalg.matrix_rank(K_condensed, tol=1e-10)
+            cond_condensed = np.linalg.cond(K_condensed)
+            cond_original = np.linalg.cond(self._Kff)
+
+            print(f"\nTESTS DE VALIDATION")
+            print(f"  Test 1 - Rangs des matrices")
+            print(f"    Rang K_ff original                  : {rank_kff_original}/{ndof_total}")
+            print(f"    Rang K_condensed                    : {rank_condensed}/{nmaster_global}")
+
+            if rank_condensed == nmaster_global:
+                print(f"    K_condensed est de rang plein")
+            elif rank_condensed >= nmaster_global - n_elastic:
+                print(f"    K_condensed presque plein (normal si DDL élastiques)")
+            else:
+                print(f"    K_condensed n'est pas de rang plein - problème détecté")
+
+            # Test 2 : Conditionnement
+            print(f"\n  Test 2 - Conditionnement")
+            print(f"    Cond(K_ff original)                 : {cond_original:.2e}")
+            print(f"    Cond(K_condensed)                   : {cond_condensed:.2e}")
+
+            improvement_factor = cond_original / cond_condensed
+            if improvement_factor > 1e3:
+                print(f"    Amélioration significative (×{improvement_factor:.1e})")
+            elif improvement_factor > 10:
+                print(f"    Amélioration modérée (×{improvement_factor:.1f})")
+            else:
+                print(f"    Peu d'amélioration (×{improvement_factor:.1f})")
+
+            if cond_condensed > 1e12:
+                warnings.warn(f"Conditionnement très élevé après condensation ({cond_condensed:.2e}). "
+                              "Le système reste numériquement fragile.")
+
+            # Test 3 : Élimination des esclaves
+            print(f"\n  Test 3 - Élimination des DDL esclaves")
+            K_test = self._Kff @ T_qr
+            qr_slave_norms = np.linalg.norm(K_test[qr_slave_indices_global, :], axis=1)
+            max_slave_norm = np.max(qr_slave_norms) if len(qr_slave_norms) > 0 else 0.0
+
+            print(f"    Max ||K @ T_qr||_esclave            : {max_slave_norm:.2e}")
+
+            if max_slave_norm < 1e-10:
+                print(f"    Esclaves parfaitement éliminés")
+            elif max_slave_norm < 1e-6:
+                print(f"    Esclaves correctement éliminés")
+            else:
+                print(f"    Esclaves mal éliminés - vérifier B")
+                warnings.warn(f"Les DDL esclaves ne sont pas correctement éliminés (résidu {max_slave_norm:.2e}). "
+                              "Vérifier le conditionnement de K_cinematique.")
+
+            # Test 4 : Cohérence énergétique
+            print(f"\n  Test 4 - Cohérence énergétique")
+            x_master_test = np.random.rand(nmaster_global)
+            x_full_test = T_qr @ x_master_test
+
+            E_reduced = 0.5 * x_master_test.T @ K_condensed @ x_master_test
+            E_full = 0.5 * x_full_test.T @ self._Kff @ x_full_test
+            energy_diff = abs(E_reduced - E_full)
+            energy_relative = energy_diff / max(abs(E_full), 1e-16)
+
+            print(f"    Énergie (espace réduit)             : {E_reduced:.2e}")
+            print(f"    Énergie (espace complet)            : {E_full:.2e}")
+            print(f"    Différence relative                 : {energy_relative:.2e}")
+
+            if energy_relative < 1e-10:
+                print(f"    Cohérence énergétique parfaite")
+            elif energy_relative < 1e-6:
+                print(f"    Cohérence énergétique acceptable")
+            else:
+                print(f"    Incohérence énergétique détectée")
+                warnings.warn(f"Incohérence énergétique ({energy_relative:.2e}). "
+                              "La condensation pourrait être incorrecte.")
+
+            # Diagnostic final
+            print(f"\n{'=' * 70}")
+            all_tests_pass = (
+                    rank_condensed >= nmaster_global - n_elastic and
+                    max_slave_norm < 1e-6 and
+                    energy_relative < 1e-6 and
+                    cond_condensed < 1e12
+            )
+
+            if all_tests_pass:
+                print("DÉCOMPOSITION QR RÉUSSIE - Tous les tests passés")
+            else:
+                print("DÉCOMPOSITION QR AVEC AVERTISSEMENTS - Vérifier les détails ci-dessus")
+
+            print(f"{'=' * 70}\n")
+
+        if print_slaves_dof:
+
+
+            slaves_dll = dll_vec[slave_indices_global]
+            slaves_dll_sorted = np.sort(slaves_dll)
+
+            print("=" * 70)
+            print("LISTE DES DDL ESCLAVES")
+            print("=" * 70)
+
+            # Séparer totalement libres et esclaves QR
+            unconstrained_dll = dll_vec[unconstrained_indices]
+            qr_slaves_dll = dll_vec[qr_slave_indices_global]
+
+            if len(unconstrained_dll) > 0:
+                print(f"\n📌 DDL totalement libres ({len(unconstrained_dll)}) :")
+                for dll in np.sort(unconstrained_dll):
+                    print(f"  {dll}")
+
+            if len(qr_slaves_dll) > 0:
+                print(f"\n🔗 DDL esclaves cinématiques ({len(qr_slaves_dll)}) :")
+                for dll in np.sort(qr_slaves_dll):
+                    print(f"  {dll}")
+
+            print("=" * 70 + "\n")
+
+    def CheckUnconstrainedDegreeOfFreedom(self, print_infos=True):
         if not self._assembled :
             self.AssemblyMatrixSystem()
 
@@ -861,18 +1357,22 @@ class MBSLinearSystem(__MBSBase):
                              "L'analyse des degrés de liberté non contraints risque d'être faussé")
 
         filtered_rows = np.all(self._Kff == 0, axis=0)
+        self.__qr_unconstrained_indices = np.array(list(range(6*self._nbodies)))[filtered_rows]
 
-        dll_body = ["X", "Y", "Z", "rX", "rY", "rZ"]
-        system_dll = []
-        for body in self.bodies :
-            system_dll += [ body.GetName + " >>> " + dll for dll  in dll_body ]
-        unconstrained_dll = np.array(system_dll)[filtered_rows]
+        if print_infos :
 
-        print("="*40)
-        print("Dégrés de liberté libres et non-conditionnés : ")
-        for s in unconstrained_dll :
-            print(s)
-        print("=" * 40)
+            dll_body = ["X", "Y", "Z", "rX", "rY", "rZ"]
+            system_dll = []
+            for body in self.bodies :
+                system_dll += [ body.GetName + " >>> " + dll for dll  in dll_body ]
+            unconstrained_dll = np.array(system_dll)[filtered_rows]
+
+            print("="*40)
+            print("Dégrés de liberté libres et non-conditionnés : ")
+            for s in unconstrained_dll :
+                print(s)
+            print("=" * 40)
+
 
 
 
@@ -896,7 +1396,8 @@ class MBSLinearSystem(__MBSBase):
                              "L'analyse modale n'est pas possible.")
 
         dll_vec = np.array([f"{body.GetName} - {d}" for d in ["x", "y", "z", "rx", "ry", "rz"] for body in self.bodies])
-        if drop_zeros :
+        non_qr_decomposed = self.__T_qr is None
+        if drop_zeros and non_qr_decomposed:
             filtered_rows = ~ np.all( self._Kff == 0, axis=0)
             K = self._Kff[filtered_rows][:,filtered_rows]
             M = self._Mff[filtered_rows][:,filtered_rows]
@@ -905,6 +1406,12 @@ class MBSLinearSystem(__MBSBase):
             filtered_rows = np.full(self._nbodies*6,True, dtype=bool)
             K = self._Kff
             M = self._Mff
+
+        T_qr = self.__T_qr
+        if T_qr is not None:
+            K = T_qr.T @ K @ T_qr
+            M = T_qr.T @ M @ T_qr
+            dll_vec = dll_vec[self.__qr_master_indices]
 
         lambda_, phi_ = eigh(K, M)
         lambda_ = self.__checkEigVals(lambda_, dll_vec)
@@ -919,6 +1426,9 @@ class MBSLinearSystem(__MBSBase):
 
         # Frequencies and pulsations
         pulsation = np.sqrt(lambda_)
+
+        if T_qr is not None :
+            phi_ = T_qr @ phi_
 
         # Déplacements modaux
         modal_displacements = np.zeros((self._nbodies*6, n_mode))
@@ -961,8 +1471,11 @@ class MBSLinearSystem(__MBSBase):
                              "L'analyse modale n'est pas possible.")
 
         dll_vec = np.array([f"{body.GetName} - {d}" for d in ["x","y","z","rx","ry","rz"] for body in self.bodies])
-        if drop_zeros :
-            filtered_rows = ~ np.all( self._Kff == 0, axis=0)
+
+        non_qr_decomposed = self.__T_qr is None
+        filtered_rows = ~ np.all(self._Kff == 0, axis=0)
+        if drop_zeros and non_qr_decomposed:
+
             K = self._Kff[filtered_rows][:,filtered_rows]
             M = self._Mff[filtered_rows][:,filtered_rows]
             dll_vec = dll_vec[filtered_rows]
@@ -970,9 +1483,21 @@ class MBSLinearSystem(__MBSBase):
             K = self._Kff
             M = self._Mff
 
+        T_qr = self.__T_qr
+        if T_qr is not None :
+            K = T_qr.T @ K @ T_qr
+            M = T_qr.T @ M @ T_qr
+            # dll_vec = dll_vec[self.__qr_master_indices]
+
+
         lambda_ = eigvalsh(K,M)
         lambda_ = self.__checkEigVals(lambda_, dll_vec)
         omega = np.sqrt(lambda_)
+
+        if T_qr is not None :
+            omega = (T_qr @ omega)
+            if drop_zeros :
+                omega = omega[filtered_rows]
 
         if sort_values :
             args_sort = np.argsort(omega)
@@ -1004,281 +1529,241 @@ class MBSLinearSystem(__MBSBase):
         else :
             return r / (np.pi *2)
 
-    def ComputeFrequencyDomainResponse(self,input_output : List,
-                                            frequency_array : np.array = None,
-                                            fstart = None , fend = None,
-                                            print_damping = True,
-                                            print_progress_step : int = None,
-                                            nbase=20):
-        """
-        Calcule la réponse fréquentielle du système par projection modale.
-
-        Cette méthode résout le système dans le domaine fréquentiel en utilisant
-        les modes propres comme base de réduction. Pour chaque fréquence ω, on calcule
-        les fonctions de transfert G(ω) = X(ω)/Xb(ω) pour les paires entrée-sortie
-        spécifiées.
-
-        Système résolu : (Kff + jω*Cff - ω²*Mff) X = (Kb + jω*Cb) Xb
-        Projection modale : X ≈ Φ·q où q vérifie le système diagonal réduit.
-
-        Parameters
-        ----------
-        input_output : List[Tuple[str, int, str, int]]
-            Liste des paires (entrée, sortie) à analyser. Chaque tuple contient :
-            - body1 (str) : nom du corps de référence (excitation)
-            - axe1 (int) : indice d'axe d'excitation (0-5 pour x,y,z,θx,θy,θz)
-            - body2 (str) : nom du corps libre (réponse)
-            - axe2 (int) : indice d'axe de réponse (0-5)
-            Exemple : [("Base", 1, "Mass1", 1)] pour y_Mass1 / y_Base
-
-        frequency_array : np.array, optional
-            Vecteur de fréquences [Hz] pour l'analyse. Si None, généré automatiquement.
-
-        fstart : float, optional
-            Fréquence de début [Hz] si frequency_array n'est pas fourni.
-            Par défaut : 0.5 * f₁ (moitié de la première fréquence propre).
-
-        fend : float, optional
-            Fréquence de fin [Hz] si frequency_array n'est pas fourni.
-            Par défaut : 2.0 * fₙ (double de la dernière fréquence propre).
-
-        print_damping : bool, optional (default=True)
-            Affiche les taux d'amortissement modaux si la matrice d'amortissement
-            est diagonale dans la base modale.
-
-        print_progress_step : int, optional (default=None)
-            Print une progression des calculs. Utiles si lourds et non diagonale.
-            Le step est un entier représentant un pourcentage.
-
-        nbase : int, optional (default=20)
-            Nombre de points par décade pour l'échantillonnage logarithmique
-            automatique des fréquences.
-
-        Returns
-        -------
-        MBSFrequencyDomainResult
-            Objet contenant :
-            - frequency_array : vecteur de fréquences [Hz]
-            - transfer_function_array : fonctions de transfert complexes G(ω)
-            - input_output_list : liste des paires analysées
-            - natural_pulsations : pulsations propres ωᵢ [rad/s]
-            - damping_factor : taux d'amortissement modaux ξᵢ (si diagonal)
-
-        Raises
-        ------
-        ValueError
-            - Si le système n'est pas totalement linéaire
-            - Si frequency_array contient des valeurs négatives ou nulles
-            - Si fstart ≤ 0 ou fend ≤ fstart
-            - Si input_output contient des corps ou axes invalides
-
-        Notes
-        -----
-        - La méthode utilise la projection modale pour réduire drastiquement le coût
-          de calcul (facteur ~n²/m où n=DDL totaux, m=nombre de modes).
-        - L'amortissement modal est automatiquement détecté : si C_modal est diagonal,
-          les taux ξᵢ sont calculés. Sinon, la matrice pleine est conservée.
-        - Les DDL sans rigidité ni amortissement sont automatiquement filtrés.
-
-        Examples
-        --------
-        >>> # Analyse FRF entre excitation verticale de la base et réponse d'une masse
-        >>> input_output = [("Base", 1, "Mass1", 1)]  # y/y
-        >>> result = system.ComputeFrequencyDomainResponse(input_output, fstart=1, fend=100)
-        >>>
-        >>> # Extraire la FRF
-        >>> tf = result.SelectTransferFunctionObject_byLocId(0)
-        >>> import matplotlib.pyplot as plt
-        >>> plt.loglog(tf.frequency, tf.module)
-
-        See Also
-        --------
-        MBSFrequencyDomainResult : Structure de retour avec méthodes d'extraction
-        ComputeModalAnalysis : Calcul préalable des modes propres
-        """
-
-        if not self._assembled :
+    def ComputeFrequencyDomainResponse(self, input_output: List,
+                                       frequency_array: np.array = None,
+                                       fstart=None, fend=None,
+                                       print_damping=True,
+                                       print_progress_step: int = None,
+                                       nbase=20):
+        if not self._assembled:
             self.AssemblyMatrixSystem()
 
-        if not self._check_linearity() :
-            raise ValueError("Le système n'est pas totalement linéaire. "
-                             "Le système comporte des liaisons non linéaires ou "
-                             "des liaisons de contact avec jeu. "
-                             "L'analyse modale n'est pas possible.")
+        if not self._check_linearity():
+            raise ValueError("Le système n'est pas totalement linéaire...")
 
-        dll_vec = np.array([f"{body.GetName} - {d}" for d in ["x", "y", "z", "rx", "ry", "rz"] for body in self.bodies])
-        filtered_rows = ~ np.all((self._Kff == 0) & (self._Cff == 0), axis=0)
-        K = self._Kff[filtered_rows][:, filtered_rows]
-        C = self._Cff[filtered_rows][:, filtered_rows]
-        M = self._Mff[filtered_rows][:, filtered_rows]
-        dll_vec = dll_vec[filtered_rows]
+        dll_vec = np.array([f"{body.GetName} - {d}"
+                            for body in self.bodies
+                            for d in ["x", "y", "z", "rx", "ry", "rz"]])
 
+        # ===================================================================
+        # PARTIE 1 : Préparation des matrices
+        # ===================================================================
+        T_qr = self.__T_qr
+        qr_decomposed = T_qr is not None
 
-        all_indexes = np.array(list(range(self._nbodies * 6)), dtype=int)
-        selected_indexes = all_indexes[filtered_rows]
-        full_index_to_reduced = {j : i for i,j in enumerate(selected_indexes) }
+        if qr_decomposed:
+            # Travailler dans l'espace QR réduit
+            K = T_qr.T @ self._Kff @ T_qr
+            C = T_qr.T @ self._Cff @ T_qr
+            M = T_qr.T @ self._Mff @ T_qr
 
-        filtered_reference_cols = ~ np.all((self._Kb == 0) & (self._Cb == 0), axis=0)
-        Kb = self._Kb[filtered_rows][:, filtered_reference_cols]
-        Cb = self._Cb[filtered_rows][:, filtered_reference_cols]
+            # Filtrage des colonnes nulles
+            filtered_reference_cols = ~np.all((self._Kb == 0) & (self._Cb == 0), axis=0)
 
-        all_reference_indexes = np.array(list(range(self._nrefbodies * 6)), dtype=int)
+            # Projection dans l'espace QR
+            Kb = T_qr.T @ self._Kb[:, filtered_reference_cols]
+            Cb = T_qr.T @ self._Cb[:, filtered_reference_cols]
+
+            dll_vec_reduced = dll_vec[self.__qr_master_indices]
+
+        else:
+            # Sans QR : filtrer les DDL non contraints
+            filtered_rows = ~np.all((self._Kff == 0) & (self._Cff == 0), axis=0)
+            filtered_reference_cols = ~np.all((self._Kb == 0) & (self._Cb == 0), axis=0)
+
+            K = self._Kff[filtered_rows][:, filtered_rows]
+            C = self._Cff[filtered_rows][:, filtered_rows]
+            M = self._Mff[filtered_rows][:, filtered_rows]
+
+            Kb = self._Kb[filtered_rows][:, filtered_reference_cols]
+            Cb = self._Cb[filtered_rows][:, filtered_reference_cols]
+
+            dll_vec_reduced = dll_vec[filtered_rows]
+
+            # Mapping pour reconstruction
+            all_indexes = np.arange(self._nbodies * 6)
+            selected_indexes = all_indexes[filtered_rows]
+
+        # Mapping pour les colonnes de référence
+        all_reference_indexes = np.arange(self._nrefbodies * 6)
         selected_reference_indexes = all_reference_indexes[filtered_reference_cols]
-        full_reference_index_to_reduced = {j: i for i, j in enumerate(selected_reference_indexes)}
+        reference_to_reduced = {idx_original: idx_reduced
+                                for idx_reduced, idx_original
+                                in enumerate(selected_reference_indexes)}
 
-
+        # ===================================================================
+        # PARTIE 2 : Analyse modale
+        # ===================================================================
         lambda_, phi = eigh(K, M)
-        lambda_ = self.__checkEigVals(lambda_, dll_vec)
+        lambda_ = self.__checkEigVals(lambda_, dll_vec_reduced)
 
-        # Normalisation  de phi_ pour obtenir
-        # phi_.T @ Mf @ phi_ = Identité
-        # phi_.T @ Kf @ phi_ = lambda_
+        # Normalisation modale
         modal_mass = np.diag(phi.T @ M @ phi)
         phi = phi @ np.diag(1 / np.sqrt(modal_mass))
 
         # Pulsations propres
         omega_0 = np.sqrt(lambda_)
 
-        # Sous-espace propre
-        Cb_phi = phi.T @ Cb
+        # Projection dans la base modale
         Kb_phi = phi.T @ Kb
+        Cb_phi = phi.T @ Cb
         Cphi = phi.T @ C @ phi
 
-        non_diag_terms_norm = np.abs( Cphi - np.diag( np.diag(Cphi) ) )
+        # Détection amortissement diagonal
+        non_diag_terms_norm = np.abs(Cphi - np.diag(np.diag(Cphi)))
         diag_terms_booleen = np.isclose(non_diag_terms_norm, 0.0, atol=0., rtol=1e-3)
         diag_damping = diag_terms_booleen.all()
 
         xi = None
-        if diag_damping :
-            # ξ ==> 2*ξ*omega_0 = diag(Cphi)
-            xi = np.diag(Cphi) / (2*omega_0)
-
-            if print_damping :
+        if diag_damping:
+            xi = np.diag(Cphi) / (2 * omega_0)
+            if print_damping:
                 print("=" * 40)
                 print("Damping factors")
-                for wi, ci in zip(omega_0, xi) :
+                for wi, ci in zip(omega_0, xi):
                     print(f"ω0 = {wi:.4e} rad/s | ξ = {ci:.4e}")
-        elif print_damping :
+        elif print_damping:
             non_zero_nondiag = non_diag_terms_norm[~diag_terms_booleen]
             print("=" * 40)
-            print("Non diagonal damping coefficients : ")
+            print("Non diagonal damping coefficients :")
             print(f"Average : {non_zero_nondiag.mean():.2e}")
             print(f"Median : {np.median(non_zero_nondiag):.2e}")
             print(f"Max : {np.max(non_zero_nondiag):.2e}")
 
-        # Validation de la structure input_output
+        # ===================================================================
+        # PARTIE 3 : Validation et mapping des indices input_output
+        # ===================================================================
         if not isinstance(input_output, list) or len(input_output) == 0:
-            raise ValueError("'input_output' doit être une liste non vide de tuples "
-                             "(body_ref, axe_ref, body_free, axe_free).")
+            raise ValueError("'input_output' doit être une liste non vide...")
 
         seen_pairs = set()
-        index_rows = []
+        index_rows_freedof = []  # Indices dans l'espace freedof ORIGINAL
         index_cols = []
 
         for item in input_output:
-            # Vérification de la structure
+            # Validations de base
             if not isinstance(item, (tuple, list)) or len(item) != 4:
-                raise ValueError(f"Chaque élément de 'input_output' doit contenir 4 éléments "
-                                 f"[str, int, str, int]. Reçu : {item}")
+                raise ValueError(f"Chaque élément doit contenir 4 éléments. Reçu : {item}")
 
             body1, axe1, body2, axe2 = item
 
-            # Vérification des types
             if not isinstance(body1, str) or not isinstance(body2, str):
-                raise TypeError(f"Les noms de corps doivent être des chaînes. "
-                                f"Reçu : body1={type(body1)}, body2={type(body2)}")
+                raise TypeError("Les noms de corps doivent être des chaînes.")
 
             if not isinstance(axe1, int) or not isinstance(axe2, int):
-                raise TypeError(f"Les indices d'axes doivent être des entiers. "
-                                f"Reçu : axe1={type(axe1)}, axe2={type(axe2)}")
+                raise TypeError("Les indices d'axes doivent être des entiers.")
 
-            # Vérification des plages d'axes
-            if not (0 <= axe1 <= 5):
-                raise ValueError(f"L'indice d'axe d'excitation doit être entre 0 et 5. "
-                                 f"Reçu : axe1={axe1} pour {body1}")
+            if not (0 <= axe1 <= 5) or not (0 <= axe2 <= 5):
+                raise ValueError("Les indices d'axes doivent être entre 0 et 5.")
 
-            if not (0 <= axe2 <= 5):
-                raise ValueError(f"L'indice d'axe de réponse doit être entre 0 et 5. "
-                                 f"Reçu : axe2={axe2} pour {body2}")
-
-            # 1 - Vérifier que body1 est un corps de référence
             if body1 not in self.ref_body_index:
-                raise ValueError(f"'{body1}' n'est pas un corps de référence (excitation). "
-                                 f"Corps de référence disponibles : {list(self.ref_body_index.keys())}")
+                raise ValueError(f"'{body1}' n'est pas un corps de référence.")
 
-            # 3 - Vérifier que body2 est un corps libre
             if body2 not in self.body_index:
-                raise ValueError(f"'{body2}' n'est pas un corps libre (réponse). "
-                                 f"Corps libres disponibles : {list(self.body_index.keys())}")
+                raise ValueError(f"'{body2}' n'est pas un corps libre.")
 
+            # Calcul des indices dans l'espace freedof ORIGINAL
             id_ref = self.ref_body_index[body1]
             id_body = self.body_index[body2]
 
-            index_ref = id_ref * 6 + axe1
-            index_body = id_body * 6 + axe2
+            index_ref_original = id_ref * 6 + axe1
+            index_body_original = id_body * 6 + axe2
 
-            # 2 - Vérifier que l'axe d'excitation est disponible (non nul dans Kb ou Cb)
-            if index_ref not in selected_reference_indexes:
+            # Vérifications de disponibilité
+            if index_ref_original not in selected_reference_indexes:
                 axe_names = ["x", "y", "z", "θx", "θy", "θz"]
-                raise ValueError(f"L'axe {axe_names[axe1]} du corps '{body1}' n'a pas "
-                                 f"de couplage d'excitation (colonnes Kb et Cb nulles).")
+                raise ValueError(f"L'axe {axe_names[axe1]} du corps '{body1}' "
+                                 f"n'a pas de couplage d'excitation.")
 
-            # 4 - Vérifier que l'axe de réponse est disponible (non nul dans Kff ou Cff)
-            if index_body not in selected_indexes:
-                axe_names = ["x", "y", "z", "θx", "θy", "θz"]
-                raise ValueError(f"L'axe {axe_names[axe2]} du corps '{body2}' n'a pas "
-                                 f"de dynamique (lignes Kff et Cff nulles).")
+            # CORRECTION : Vérifier seulement que ce n'est pas un DDL totalement libre
+            if qr_decomposed:
+                # Interdire seulement les DDL totalement libres (unconstrained)
+                if index_body_original in self.__qr_unconstrained_indices:
+                    axe_names = ["x", "y", "z", "θx", "θy", "θz"]
+                    raise ValueError(f"L'axe {axe_names[axe2]} du corps '{body2}' "
+                                     f"est totalement libre (non contraint). "
+                                     f"Pas de réponse fréquentielle définie.")
+                # Les esclaves sont OK, ils seront reconstruits par T_qr
+            else:
+                # Sans QR : vérifier dans filtered_rows
+                if not filtered_rows[index_body_original]:
+                    axe_names = ["x", "y", "z", "θx", "θy", "θz"]
+                    raise ValueError(f"L'axe {axe_names[axe2]} du corps '{body2}' "
+                                     f"n'a pas de dynamique.")
 
-            # 5 - Vérifier qu'il n'y a pas de duplication
+            # Vérification duplication
             pair_signature = (body1, axe1, body2, axe2)
             if pair_signature in seen_pairs:
-                raise ValueError(f"Paire dupliquée détectée : {pair_signature}")
+                raise ValueError(f"Paire dupliquée : {pair_signature}")
             seen_pairs.add(pair_signature)
 
-            # Enregistrement des indices réduits
-            index_cols.append(full_reference_index_to_reduced[index_ref])
-            index_rows.append(full_index_to_reduced[index_body])
+            # Enregistrer les indices dans l'espace freedof ORIGINAL
+            index_rows_freedof.append(index_body_original)
+            index_cols.append(reference_to_reduced[index_ref_original])
 
-
-
-        if frequency_array is not None :
-            if not np.all( frequency_array > 0 ) :
+        # ===================================================================
+        # PARTIE 4 : Génération du vecteur de fréquences
+        # ===================================================================
+        if frequency_array is not None:
+            if not np.all(frequency_array > 0):
                 raise ValueError("'frequency_array' must be positive")
             npoints = len(frequency_array)
-        elif (fstart is not None and fend is not None) :
-            if not fstart >0 : raise ValueError("'fstart' must be positive")
-            if not fend > fstart : raise ValueError("'fend' must be greater than 'fstart'")
+        elif (fstart is not None and fend is not None):
+            if not fstart > 0:
+                raise ValueError("'fstart' must be positive")
+            if not fend > fstart:
+                raise ValueError("'fend' must be greater than 'fstart'")
             npoints = int(nbase * fend / fstart)
             frequency_array = np.logspace(np.log10(fstart), np.log10(fend), npoints)
-        else :
-            fstart = 0.5 * omega_0[omega_0>0].min() / (2 * np.pi)
-            fend = 2.0 * omega_0[omega_0>0].max() / (2 * np.pi)
+        else:
+            fstart = 0.5 * omega_0[omega_0 > 0].min() / (2 * np.pi)
+            fend = 2.0 * omega_0[omega_0 > 0].max() / (2 * np.pi)
             npoints = int(nbase * fend / fstart)
             frequency_array = np.logspace(np.log10(fstart), np.log10(fend), npoints)
 
-
+        # ===================================================================
+        # PARTIE 5 : Calcul de la réponse fréquentielle
+        # ===================================================================
         Gi_array = []
         print_progress_step = int(print_progress_step) if print_progress_step is not None else 0
         print_progress = print_progress_step > 0
-        progress_step = [npoints * r/100 for r in range(0,100,print_progress_step)] if print_progress else []
-        for i, wi in enumerate(frequency_array * 2 * np.pi) :
-            if len(progress_step)>0 and i>progress_step[0] :
-                print(f"     Progression >> {int(100 * i/npoints)} %")
+        progress_step = [npoints * r / 100 for r in range(0, 100, print_progress_step)] if print_progress else []
+
+        for i, wi in enumerate(frequency_array * 2 * np.pi):
+            if len(progress_step) > 0 and i > progress_step[0]:
+                print(f"     Progression >> {int(100 * i / npoints)} %")
                 progress_step.pop(0)
 
-            if diag_damping :
-                Hinv = np.diag(1/(omega_0**2 + 1j*wi*2*xi*omega_0 - wi**2))
-            else :
-                H = np.diag(omega_0**2 - wi**2) + 1j*wi*Cphi
+            # Calcul dans l'espace modal
+            if diag_damping:
+                Hinv = np.diag(1 / (omega_0 ** 2 + 1j * wi * 2 * xi * omega_0 - wi ** 2))
+            else:
+                H = np.diag(omega_0 ** 2 - wi ** 2) + 1j * wi * Cphi
                 Hinv = np.linalg.inv(H)
 
+            # Réponse modale
             Gqi = Hinv @ (Kb_phi + 1j * wi * Cb_phi)
-            Gi = phi @ Gqi
 
-            Gi_array.append( Gi[index_rows,index_cols] )
+            # Reconstruction dans l'espace de travail (QR réduit ou filtré)
+            Gi_workspace = phi @ Gqi  # Shape: (n_workspace, n_excitations)
+
+            # CORRECTION CRITIQUE : Reconstruction dans l'espace freedof complet
+            if qr_decomposed:
+                # Reconstruire TOUS les DDL (masters + esclaves) avec T_qr
+                Gi_freedof = T_qr @ Gi_workspace  # Shape: (n_freedof, n_excitations)
+            else:
+                # Sans QR : reconstruire avec zéros pour les DDL filtrés
+                Gi_freedof = np.zeros((self._nbodies * 6, Gi_workspace.shape[1]), dtype=complex)
+                Gi_freedof[selected_indexes, :] = Gi_workspace
+
+            # Extraction des indices demandés dans l'espace freedof complet
+            Gi_array.append(Gi_freedof[index_rows_freedof, index_cols])
+
         Gi_array = np.array(Gi_array)
+
         return MBSFrequencyDomainResult(frequency_array,
                                         Gi_array,
                                         input_output,
                                         omega_0,
                                         xi)
+

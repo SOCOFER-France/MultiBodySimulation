@@ -392,6 +392,7 @@ class MBSLinkKinematic(_MBSLink3D):
                         Ry : int=0.,
                         Rz : int=0.,
                         kinematic_tolerance=1e-4,
+                        damping_decay_factor = 1.0,
                  ):
         self.__kinematicConstraints = np.array([Tx, Ty, Tz, Rx, Ry, Rz])
 
@@ -401,9 +402,9 @@ class MBSLinkKinematic(_MBSLink3D):
         M = max(body1._mass, body2._mass)
         Jm = max(np.max(body1._inertia), np.max(body2._inertia))
         k = M / kinematic_tolerance
-        c = 2 * np.sqrt(k * M)
+        c = 2 * np.sqrt(k * M) * damping_decay_factor
         ktheta = Jm / (2 * np.pi * kinematic_tolerance)
-        ctheta = 2 * np.sqrt(ktheta * Jm)
+        ctheta = 2 * np.sqrt(ktheta * Jm) * damping_decay_factor
 
         Kmat = np.diag([Tx, Ty, Tz]) * k
         Cmat = np.diag([Tx, Ty, Tz]) * c
@@ -433,6 +434,9 @@ class MBSLinkKinematic(_MBSLink3D):
     @property
     def GetRotConstraints(self):
         return self.__kinematicConstraints[:3]
+
+    def GetConstraintMatrix(self):
+        return np.diag(self.__kinematicConstraints)
 
     def SetTransFriction(self, normalInitialContactForces: float = 0.,
                          frictionCoefficient: float = 0.2,
