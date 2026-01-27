@@ -3,7 +3,6 @@ from typing import Dict, List, Optional
 from scipy.sparse import csc_matrix
 from scipy.integrate import solve_ivp
 from scipy.linalg import eigvalsh, eigh
-from scipy.linalg import qr as QR_decomposition
 import warnings
 
 from MultiBodySimulation.MBSMechanicalJoint import _MBSLink3D
@@ -11,7 +10,12 @@ from MultiBodySimulation.MBSBody import MBSRigidBody3D, MBSReferenceBody3D
 from MultiBodySimulation.MBSSimulationResults import (MBSBodySimulationResult,
                                                       MBSModalResults,
                                                       MBSFrequencyDomainResult)
-
+from MultiBodySimulation.MBS_numerics import (QR_validate_protected_masters,
+                                              QR_inverse_double_permutation,
+                                                QR_identify_protected_dof,
+                                                QR_create_reordered_matrix,
+                                              QR_decomposition,
+                                              QR_protectedPivoting)
 
 
 class __MBSBase:
@@ -863,107 +867,91 @@ class MBSLinearSystem(__MBSBase):
         lambda_ = np.maximum(lambda_, 0.0)
         return lambda_
 
-    def __all_dll(self, reference:bool = True):
+    def __all_dll(self, reference:bool = True, freebodies:bool = True):
         ref_dll = [f"{body.GetName} - {dof}"
              for body in self.ref_bodies
              for dof in ["x", "y", "z", "rx", "ry", "rz"]] if reference else []
-        return np.array(
-            ref_dll +\
-            [f"{body.GetName} - {dof}"
-             for body in self.bodies
-             for dof in ["x", "y", "z", "rx", "ry", "rz"]]
-        )
 
+        free_dll = [f"{body.GetName} - {dof}"
+             for body in self.bodies
+             for dof in ["x", "y", "z", "rx", "ry", "rz"]] if freebodies else []
+        return np.array(
+            ref_dll + free_dll
+        )
 
     def ComputeQrDecomposedSystem(self, print_infos=False,
                                   print_slaves_dof=False,
                                   rtol=None,
-                                  drop_unconstrained_rows=True):
+                                  protected_dof_spec:List[tuple] = None,
+                                  drop_unconstrained_rows=True,
+                                  raise_slaved_fixed = False):
         """
         Décompose le système en identifiant les degrés de liberté maîtres et esclaves.
 
-        Cette méthode utilise une décomposition QR avec pivotage pour détecter automatiquement
-        les dépendances cinématiques dans le système (liaisons rigidifiées par pénalisation).
-        Les DDL esclaves sont exprimés comme combinaisons linéaires des DDL maîtres, permettant
-        une condensation du système qui élimine les modes parasites à haute fréquence.
+        VERSION AMÉLIORÉE avec protection garantie des DDL fixés (excitations).
 
-        Contexte d'utilisation
-        ----------------------
-        Lorsqu'un système multi-corps contient des liaisons cinématiques rigidifiées par
-        pénalisation (raideur k → ∞), la matrice de raideur K devient singulière ou très
-        mal conditionnée. Cela génère :
+        Cette méthode utilise une décomposition QR avec pivotage CONTRAINT pour :
+        1. Détecter automatiquement les dépendances cinématiques
+        2. GARANTIR que les DDL fixés restent maîtres (excitations du système)
+        3. Construire une base réduite éliminant les modes parasites haute fréquence
 
-        - Des valeurs propres négatives parasites (∼-1e-5)
-        - Des fréquences propres irréalistes (>1e4 Hz)
-        - Des instabilités numériques en simulation
-
-        La décomposition QR identifie ces dépendances et construit une base réduite où
-        seuls les DDL indépendants (maîtres) sont conservés.
-
-        Principe mathématique
-        ---------------------
-        1. Extraction de K_cinematique (raideurs de pénalisation uniquement)
-        2. Décomposition QR : K @ P = Q @ R avec pivotage
-        3. Détection du rang numérique de R
-        4. Construction de la relation x_slave = B @ x_master
-        5. Assemblage de T_qr : x_freedof = T_qr @ x_master
-
-        Classification des DDL
-        ----------------------
-        - **DDL totalement libres** : Aucune contrainte (K = 0, C = 0)
-        - **DDL élastiques purs** : Contraints uniquement par ressorts (pas de contraintes cinématiques)
-        - **DDL maîtres QR** : DDL indépendants dans les contraintes cinématiques
-        - **DDL esclaves QR** : Déterminés algébriquement par les maîtres
+        Améliorations par rapport à la version précédente
+        ------------------------------------------------
+        - Suppression du hack `fixed_multiplier` (non fiable)
+        - Réorganisation structurelle de la matrice avant QR
+        - Protection GARANTIE des DDL fixés par construction
+        - Validation explicite avec messages d'erreur informatifs
+        - Gestion robuste du cas rank < n_protected (mécanisme sur-contraint)
 
         Parameters
         ----------
         print_infos : bool, optional
-            Affiche un rapport détaillé de la décomposition incluant :
-            - Nombre de DDL par catégorie
-            - Rang numérique et conditionnement des matrices
-            - Tests de validation de la décomposition
-            - Avertissements si problèmes détectés
-            Par défaut : False
-
+            Affiche un rapport détaillé de la décomposition (défaut : False)
         print_slaves_dof : bool, optional
-            Affiche la liste complète des DDL esclaves identifiés.
-            Utile pour comprendre quels DDL sont déterminés par d'autres.
-            Par défaut : False
-
+            Affiche la liste complète des DDL esclaves (défaut : False)
         rtol : float, optional
-            Tolérance relative pour la détection du rang numérique.
-            Si spécifiée : tolerance = rtol × σ_max
-            Si None : tolerance automatique = σ_max × √ε × max(dimensions)
-            où σ_max est la plus grande valeur singulière et ε la précision machine.
-            Recommandé : laisser None (détection automatique).
-            Par défaut : None
-
+            Tolérance relative pour la détection du rang (défaut : automatique)
         drop_unconstrained_rows : bool, optional
-            Si True, les DDL totalement libres (non contraints) sont automatiquement
-            exclus de l'analyse et du système condensé.
-            Si False, tous les DDL sont conservés (déconseillé).
-            Par défaut : True
+            Exclut les DDL totalement libres de l'analyse (défaut : True)
+        protected_dof_spec : List[dict] , option
+            Lister les dof des corps de référence à protéger
+                ("corps", axe) avec axe l'indice 0 : x, 1 : y, ... 3 : rx, ...
 
+        Raises
+        ------
+        ValueError
+            - Si le système n'est pas linéaire
+            - Si aucune liaison cinématique n'existe
+            - Si rank < n_protected (mécanisme sur-contraint)
+        RuntimeError
+            - Si les DDL protégés ne sont pas maîtres (bug algorithmique)
         """
+        # ===================================================================
+        # VALIDATIONS PRÉLIMINAIRES
+        # ===================================================================
         if not self._assembled:
             self.AssemblyMatrixSystem()
 
         if not self._check_linearity():
-            raise ValueError("Le système n'est pas totalement linéaire. "
-                             "Le système comporte des liaisons non linéaires ou "
-                             "des liaisons de contact avec jeu. "
-                             "L'analyse des degrés de liberté sur-contraints risque d'être faussée")
+            raise ValueError(
+                "Le système n'est pas totalement linéaire. "
+                "Le système comporte des liaisons non linéaires ou "
+                "des liaisons de contact avec jeu. "
+                "L'analyse des degrés de liberté sur-contraints risque d'être faussée"
+            )
 
         if self.__n_kinematic_links == 0:
-            raise ValueError("Le système n'a pas de liaisons cinématiques. "
-                             "Pas de décomposition QR nécessaire")
+            raise ValueError(
+                "Le système n'a pas de liaisons cinématiques. "
+                "Pas de décomposition QR nécessaire"
+            )
+
 
         ndof_total = 6 * (self._nbodies + self._nrefbodies)
         all_indices = np.arange(ndof_total)
-        dll_vec = self.__all_dll()
 
         # ===================================================================
-        # ÉTAPE 1 : Identification des DLL totalement non contraints
+        # ÉTAPE 1 : Classification des DDL (inchangé)
         # ===================================================================
         if drop_unconstrained_rows:
             unconstrained_mask = np.isclose(self._Kmatrix, 0).all(axis=0)
@@ -972,78 +960,116 @@ class MBSLinearSystem(__MBSBase):
 
         unconstrained_indices = all_indices[unconstrained_mask]
 
-        # ===================================================================
-        # ÉTAPE 2 : Matrice de raideur purement cinématique
-        # ===================================================================
+        # Matrice cinématique (SANS multiplication artificielle)
         K_cinematique = (self._Pmat_linkage @ self._Kmat_kinematic @ self._Qmat_linkage)
-        # Augmentation artificielle des coefficients des DDL bloqués pour garantir
-        # leur sélection comme DDL maîtres lors du pivotage QR (priorité aux référentiels)
-        K_cinematique[self._fixeddof, :] *= 1e3
-        K_cinematique[:, self._fixeddof] *= 1e3
 
-        # ===================================================================
-        # ÉTAPE 3 : Identification des DLL contraints uniquement par élasticité
-        # ===================================================================
+        # DDL élastiques purs (contraints mais pas cinématiquement)
         elastic_only_mask = (~unconstrained_mask) & np.all(K_cinematique == 0, axis=0)
         elastic_only_indices = all_indices[elastic_only_mask]
 
-        # ===================================================================
-        # ÉTAPE 4 : DLL concernés par la décomposition QR
-        # ===================================================================
+        # DDL contraints cinématiquement (cible de l'analyse QR)
         kinematic_constrained_mask = (~unconstrained_mask) & (~elastic_only_mask)
         kinematic_constrained_indices = all_indices[kinematic_constrained_mask]
-        Kf_to_decompose = K_cinematique[kinematic_constrained_mask][:, kinematic_constrained_mask]
         ndof_qr = len(kinematic_constrained_indices)
+        # ===================================================================
+        # ÉTAPE 2 : Identification des DDL à protéger
+        # ===================================================================
+        fixed_bodies_names = [b.GetName for b in self.ref_bodies]
+        ref_body_map = {b.GetName : x for b,x in self.body_index_map.items() if b.GetName in fixed_bodies_names}
+
+        protected_global, protected_local = QR_identify_protected_dof(
+                                                    self._fixeddof,
+                                                    kinematic_constrained_indices,
+                                                    ref_body_map,
+                                                    protected_dof_spec=protected_dof_spec
+                                                )
+        n_protected = len(protected_global)
+
+        if print_infos:
+            print("=" * 70)
+            print("DÉCOMPOSITION QR - PROTECTION DES DDL FIXÉS")
+            print("=" * 70)
+            print(f"\n CLASSIFICATION DES DDL")
+            print(f"  DDL total                             : {ndof_total}")
+            print(f"  ├─ DDL totalement libres              : {len(unconstrained_indices)}")
+            print(f"  ├─ DDL élastiques purs                : {len(elastic_only_indices)}")
+            print(f"  └─ DDL avec contraintes cinématiques  : {ndof_qr}")
+            print(f"      └─ DDL fixés à protéger           : {n_protected}")
+            if n_protected > 0:
+                print(f"         Indices globaux : {protected_global}")
 
         # ===================================================================
-        # ÉTAPE 5 : Décomposition QR avec pivotage
+        # ÉTAPE 3 : Réorganisation de la matrice
         # ===================================================================
-        Q, R, P = QR_decomposition(Kf_to_decompose, mode='economic', pivoting=True)
+        K_reordered, reorder_map, _ = QR_create_reordered_matrix(
+            K_cinematique, kinematic_constrained_indices, protected_local
+        )
 
-        # Détermination du rang avec SVD (plus robuste que diag(R))
-        svd = np.linalg.svd(Kf_to_decompose, compute_uv=False)
+        # ===================================================================
+        # ÉTAPE 4 : Décomposition QR avec pivotage
+        # ===================================================================
+        if protected_dof_spec is not None :
+            Q, R, P, _ = QR_protectedPivoting(K_reordered, n_protected, rtol)
+        else :
+            Q, R, P = QR_decomposition(K_reordered, mode='full', pivoting=True)
+
+        # Détermination du rang avec SVD
+        svd = np.linalg.svd(K_reordered, compute_uv=False)
 
         if rtol is not None:
             tolerance = rtol * svd.max()
         else:
             eps = np.finfo(float).eps
-            tolerance = svd.max() * np.sqrt(eps) * max(Kf_to_decompose.shape)
+            tolerance = svd.max() * np.sqrt(eps) * max(K_reordered.shape)
 
         rank = np.sum(svd > tolerance)
         nslaves_qr = ndof_qr - rank
+        cond_K = svd.max() / svd[svd > tolerance].min() if rank > 0 else np.inf
 
-        # Conditionnement
-        cond_K_cinematique = svd.max() / svd[svd > tolerance].min() if rank > 0 else np.inf
+        # ===================================================================
+        # VALIDATION CRITIQUE : rank >= n_protected
+        # ===================================================================
+        if rank < n_protected:
+            raise ValueError(
+                f"\n{'=' * 70}\n"
+                f"ERREUR : Mécanisme sur-contraint\n"
+                f"{'=' * 70}\n"
+                f"Impossible de protéger {n_protected} DDL alors que le système\n"
+                f"n'a que {rank} degrés de liberté indépendants.\n"
+                f"\n"
+                f"DDL à protéger (fixeddof)    : {protected_global}\n"
+                f"Rang détecté (QR)            : {rank}\n"
+                f"Déficit                      : {n_protected - rank} DDL\n"
+                f"\n"
+                f"CAUSES POSSIBLES :\n"
+                f"  1. Mécanisme hyperstatique (trop de liaisons)\n"
+                f"  2. DDL fixés redondants avec contraintes cinématiques\n"
+                f"  3. Liaisons contradictoires ou boucle fermée mal définie\n"
+                f"\n"
+                f"SOLUTIONS :\n"
+                f"  → Réduire le nombre de DDL fixés\n"
+                f"  → Vérifier la cohérence des liaisons cinématiques\n"
+                f"  → Analyser la matrice K_cinematique (SVD) pour identifier\n"
+                f"    les dépendances linéaires\n"
+                f"{'=' * 70}"
+            )
 
         if print_infos:
-            print("=" * 70)
-            print("DÉCOMPOSITION QR - IDENTIFICATION MAÎTRES/ESCLAVES")
-            print("=" * 70)
-            print(f"\n STRUCTURE DU SYSTÈME")
-            print(f"  Degrés de liberté total               : {ndof_total}")
-            print(f"  ├─ DDL totalement libres              : {len(unconstrained_indices)}")
-            print(f"  ├─ DDL élastiques purs                : {len(elastic_only_indices)}")
-            print(f"  └─ DDL avec contraintes cinématiques  : {ndof_qr}")
-            print(f"      ├─ DDL maîtres QR                 : {rank}")
-            print(f"      └─ DDL esclaves QR                : {nslaves_qr}")
-
-            print(f"\n ANALYSE NUMÉRIQUE")
-            print(f"  Conditionnement K_cinematique         : {cond_K_cinematique:.2e}")
-
-            # Classification du conditionnement
-            if cond_K_cinematique < 1e6:
-                cond_status = " Excellent"
-            elif cond_K_cinematique < 1e10:
-                cond_status = " Acceptable"
-            elif cond_K_cinematique < 1e15:
-                cond_status = "️ Mal conditionné"
+            print(f"\n ANALYSE NUMÉRIQUE (matrice réorganisée)")
+            print(f"  Conditionnement K_reordered           : {cond_K:.2e}")
+            if cond_K < 1e6:
+                print(f"  Statut                                : ✓ Excellent")
+            elif cond_K < 1e10:
+                print(f"  Statut                                : ✓ Acceptable")
+            elif cond_K < 1e15:
+                print(f"  Statut                                : ⚠ Mal conditionné")
             else:
-                cond_status = " Très mal conditionné"
-            print(f"  Statut                                : {cond_status}")
+                print(f"  Statut                                : ✗ Très mal conditionné")
 
-            print(f"  Tolérance SVD appliquée               : {tolerance:.2e}")
-            print(f"  Valeur singulière max                 : {svd.max():.2e}")
-            print(f"  Valeur singulière min (>tol)          : {svd[svd > tolerance].min():.2e}")
+            print(f"  Tolérance SVD                         : {tolerance:.2e}")
+            print(f"  Rang détecté                          : {rank}/{ndof_qr}")
+            print(f"  DDL maîtres QR                        : {rank}")
+            print(f"  DDL esclaves QR                       : {nslaves_qr}")
 
             # Distribution des valeurs singulières
             print(f"\n  Distribution des valeurs singulières :")
@@ -1054,60 +1080,63 @@ class MBSLinearSystem(__MBSBase):
                     print(f"    > {thresh:.0e} × σ_max : {n_above}/{ndof_qr}")
 
         # ===================================================================
-        # ÉTAPE 6 : Construction de la matrice de couplage B
+        # ÉTAPE 5 : Construction de la matrice de couplage B
         # ===================================================================
-        R_mm = R[:rank, :rank]
-        R_ms = R[:rank, rank:]
+        if nslaves_qr == 0:
+            # Cas limite : tous les DDL cinématiques sont maîtres
+            if print_infos:
+                print(f"\n ℹ Aucun DDL esclave détecté (système de rang plein)")
+            return
+        else:
+            R_mm = R[:rank, :rank]
+            R_ms = R[:rank, rank:]
 
-        if nslaves_qr > 0:
+            # Résolution : R_ms @ B = -R_mm
+            # Méthode robuste : moindres carrés
             B, _, _, _ = np.linalg.lstsq(R_ms, -R_mm, rcond=None)
-            # Méthode 1 : Pseudo-inverse (plus robuste)
-            from scipy.linalg import pinv
 
-            # On veut résoudre : R_ms @ B = -R_mm
-            # Solution aux moindres carrés : B = pinv(R_ms) @ (-R_mm)
-            # R_ms_pinv = pinv(R_ms)
-            # B = R_ms_pinv @ (-R_mm)
-
+            # Vérification de la qualité
             residual_matrix = R_ms @ B + R_mm
             residual_norm = np.linalg.norm(residual_matrix)
-            residual_relative = residual_norm / np.linalg.norm(R_mm)
+            residual_relative = residual_norm / (np.linalg.norm(R_mm) + 1e-16)
 
             if print_infos:
                 print(f"\n CONSTRUCTION DE LA MATRICE DE COUPLAGE B")
                 print(f"  Dimensions B                          : {B.shape}")
                 print(f"  Résidu ||R_ms @ B + R_mm||            : {residual_norm:.2e}")
                 print(f"  Résidu relatif                        : {residual_relative:.2e}")
-                print(f"  Norme de B                            : {np.linalg.norm(B):.2e}")
 
                 if residual_relative > 1e-6:
-                    print(f"  Résidu élevé - vérifier le conditionnement")
-                    print(f"    Cela indique probablement :")
-                    print(f"      - Des liaisons cinématiques en série mal définies")
-                    print(f"      - Des contraintes contradictoires")
-                    print(f"      - Une boucle fermée avec dépendances")
-
-        else:
-            self.__T_qr = None
-            self.__qr_master_indices = None
-            self.__free_unconstrained_indices = None
-            warnings.warn("Aucun DDL esclave détecté par QR. Système déjà de rang plein.")
-            return
+                    print(f"  ⚠ Résidu élevé - vérifier :")
+                    print(f"    - Liaisons en série mal définies")
+                    print(f"    - Contraintes contradictoires")
+                    print(f"    - Boucle fermée avec dépendances")
 
         # ===================================================================
-        # ÉTAPE 7-9 : Construction de T_qr globale
+        # ÉTAPE 6 : Construction de T_local (espace QR après pivotage)
         # ===================================================================
-        T_c_local = np.zeros((ndof_qr, rank))
-        T_c_local[:rank, :] = np.eye(rank)
-        T_c_local[rank:, :] = B
+        T_local = np.zeros((ndof_qr, rank))
+        T_local[:rank, :] = np.eye(rank)  # Maîtres
+        if nslaves_qr > 0:
+            T_local[rank:, :] = B  # Esclaves
 
+        # ===================================================================
+        # ÉTAPE 7 : Double dé-permutation vers espace kinematic original
+        # ===================================================================
+        master_in_kinematic, combined_permutation = QR_inverse_double_permutation(
+            P, reorder_map, rank
+        )
+
+        # Construction de T_c_full dans l'espace kinematic original
         T_c_full = np.zeros((ndof_qr, rank))
-        T_c_full[P, :] = T_c_local
+        T_c_full[combined_permutation, :] = T_local
 
-        master_indices_qr_perm = np.arange(rank)
-        master_indices_qr_orig = P[master_indices_qr_perm]
-        qr_master_indices_global = kinematic_constrained_indices[master_indices_qr_orig]
+        # Indices globaux des maîtres QR
+        qr_master_indices_global = kinematic_constrained_indices[master_in_kinematic]
 
+        # ===================================================================
+        # ÉTAPE 8 : Construction de T_qr globale (intégration elastic_only)
+        # ===================================================================
         n_elastic = len(elastic_only_indices)
         nmaster_global = rank + n_elastic
 
@@ -1115,26 +1144,56 @@ class MBSLinearSystem(__MBSBase):
         T_qr[np.ix_(kinematic_constrained_indices, np.arange(rank))] = T_c_full
         T_qr[np.ix_(elastic_only_indices, rank + np.arange(n_elastic))] = np.eye(n_elastic)
 
+        # Indices maîtres globaux finaux
+        master_indices_global = np.concatenate([qr_master_indices_global, elastic_only_indices])
+
         # ===================================================================
-        # ÉTAPE 10 : Stockage
+        # ÉTAPE 9 : VALIDATION CRITIQUE - Protection garantie
         # ===================================================================
+        QR_validate_protected_masters(protected_global, master_indices_global, raise_error = raise_slaved_fixed)
+
+
+        # ===================================================================
+        # ÉTAPE 10 : Classification finale et stockage
+        # ===================================================================
+        qr_freedof = np.array([i for i, m in enumerate(master_indices_global)
+                               if m in self._freedof])
+        qr_fixeddof = np.array([i for i, m in enumerate(master_indices_global)
+                                if m in self._fixeddof])
+        master_freedof = np.array([m for m in master_indices_global
+                                   if m in self._freedof])
+        master_fixeddof = np.array([m for m in master_indices_global
+                                    if m in self._fixeddof])
+        free_unconstrained_indices = np.array([i for i in unconstrained_indices
+                                               if i in self._freedof])
+
+        # Stockage
         self.__T_qr = T_qr
-        master_indices_global = np.concatenate([elastic_only_indices, qr_master_indices_global])
-
-        qr_freedof  = [i for i,m in enumerate(master_indices_global) if m in self._freedof]
-        qr_fixeddof = [i for i,m in enumerate(master_indices_global) if m in self._fixeddof]
-        master_freedof = [m for i, m in enumerate(master_indices_global) if m in self._freedof]
-        master_fixeddof = [m for i, m in enumerate(master_indices_global) if m in self._fixeddof]
-        free_unconstrained_indices = [i for i in unconstrained_indices if i in self._freedof]
-
-
-
         self.__qr_master_indices = master_indices_global
         self.__free_unconstrained_indices = free_unconstrained_indices
         self.__qr_freedof = qr_freedof
         self.__qr_fixeddof = qr_fixeddof
         self.__master_freedof = master_freedof
         self.__master_fixeddof = master_fixeddof
+
+        if print_infos:
+            print(f"\n SYSTÈME CONDENSÉ FINAL")
+            print(f"  DDL maîtres total                     : {nmaster_global}")
+            print(f"  ├─ Maîtres QR (cinématiques)          : {rank}")
+            print(f"  └─ Élastiques purs                    : {n_elastic}")
+            print(f"  DDL maîtres libres                    : {len(qr_freedof)}")
+            print(f"  DDL maîtres fixés                     : {len(qr_fixeddof)}")
+            print("=" * 70)
+
+        if print_slaves_dof and nslaves_qr > 0:
+            slave_indices_local = P[rank:]
+            slave_indices_kinematic = reorder_map[slave_indices_local]
+            slave_indices_global = kinematic_constrained_indices[slave_indices_kinematic]
+            slave_dll = self.__all_dll(reference=True, freebodies=True)[slave_indices_global]
+            print(f"\n DDL ESCLAVES IDENTIFIÉS ({nslaves_qr}) :")
+            print(f"  Indices globaux : {slave_dll}")
+
+
 
 
 
@@ -1208,13 +1267,11 @@ class MBSLinearSystem(__MBSBase):
         # ===================================================================
         use_qr = self.__T_qr is not None
         if use_qr :
-            # Construction de la matrice de projection T_qr_ff
-            # Lignes : maîtres free | Colonnes : dll free
-            T_qr_ff = self.__T_qr[self._freedof][:, self.__qr_freedof]
+            K_qr = self.__T_qr.T @ self._Kmatrix @ self.__T_qr
+            M_qr = self.__T_qr.T @ self._Mmatrix @ self.__T_qr
 
-            # Projection des matrices dans l'espace des maîtres free
-            K = T_qr_ff.T @ self._Kff @ T_qr_ff
-            M = T_qr_ff.T @ self._Mff @ T_qr_ff
+            K = K_qr[np.ix_(self.__qr_freedof, self.__qr_freedof)]
+            M = M_qr[np.ix_(self.__qr_freedof, self.__qr_freedof)]
 
             # Vecteur des DDL maîtres free
             dll_vec = self.__all_dll(reference=True)[self.__master_freedof]
@@ -1275,16 +1332,16 @@ class MBSLinearSystem(__MBSBase):
         # ===================================================================
         use_qr = self.__T_qr is not None
         if use_qr:
-            # Construction de la matrice de projection T_qr_ff
-            # Lignes : maîtres free | Colonnes : dll free
-            T_qr_ff = self.__T_qr[self._freedof][:, self.__qr_freedof]
+            K_qr = self.__T_qr.T @ self._Kmatrix @ self.__T_qr
+            M_qr = self.__T_qr.T @ self._Mmatrix @ self.__T_qr
 
-            # Projection des matrices dans l'espace des maîtres free
-            K = T_qr_ff.T @ self._Kff @ T_qr_ff
-            M = T_qr_ff.T @ self._Mff @ T_qr_ff
+            K = K_qr[np.ix_(self.__qr_freedof, self.__qr_freedof)]
+            M = M_qr[np.ix_(self.__qr_freedof, self.__qr_freedof)]
 
             # Vecteur des DDL maîtres free
             dll_vec = self.__all_dll(reference=True)[self.__master_freedof]
+
+            T_qr_ff = self.__T_qr[np.ix_(self._freedof, self.__qr_freedof)]
 
 
         # ===================================================================
@@ -1373,299 +1430,44 @@ class MBSLinearSystem(__MBSBase):
         if not self._check_linearity():
             raise ValueError("Le système n'est pas totalement linéaire...")
 
-        # ===================================================================
-        # PARTIE 1 : Préparation des matrices
-        # ===================================================================
-        T_qr = self.__T_qr
-        qr_decomposed = T_qr is not None
-
-        if qr_decomposed:
-            # ===============================================================
-            # Construction de T_qr_ff : sous-matrice free → masters_free
-            # ===============================================================
-
-            # Extraction : lignes = freedof, colonnes = masters_free
-            T_qr_ff = T_qr[np.ix_(self._freedof, self.__qr_freedof)]
-
-            # Projection dans l'espace maîtres free
-            K = T_qr_ff.T @ self._Kff @ T_qr_ff
-            C = T_qr_ff.T @ self._Cff @ T_qr_ff
-            M = T_qr_ff.T @ self._Mff @ T_qr_ff
-
-            # Filtrage des colonnes de référence non nulles
-            filtered_reference_cols = ~np.all((self._Kb == 0) & (self._Cb == 0), axis=0)
-
-            # Projection des matrices de couplage
-            Kb = T_qr_ff.T @ self._Kb[:, filtered_reference_cols]
-            Cb = T_qr_ff.T @ self._Cb[:, filtered_reference_cols]
-
-            # Vecteur des DDL (dans l'espace total avec référence)
-            dll_vec_all = self.__all_dll(reference=True)
-            dll_vec_reduced = dll_vec_all[self.__master_freedof]
-
-        else:
-            # ===============================================================
-            # Sans QR : filtrer les DDL non contraints
-            # ===============================================================
-            filtered_rows = ~np.all((self._Kff == 0) & (self._Cff == 0), axis=0)
-            filtered_reference_cols = ~np.all((self._Kb == 0) & (self._Cb == 0), axis=0)
-
-            K = self._Kff[filtered_rows][:, filtered_rows]
-            C = self._Cff[filtered_rows][:, filtered_rows]
-            M = self._Mff[filtered_rows][:, filtered_rows]
-
-            Kb = self._Kb[filtered_rows][:, filtered_reference_cols]
-            Cb = self._Cb[filtered_rows][:, filtered_reference_cols]
-
-            dll_vec = self.__all_dll(reference=False)
-            dll_vec_reduced = dll_vec[filtered_rows]
-
-            # Mapping pour reconstruction
-            all_indexes = np.arange(self._nbodies * 6)
-            selected_indexes = all_indexes[filtered_rows]
-
-        # Mapping pour les colonnes de référence
-        all_reference_indexes = np.arange(self._nrefbodies * 6)
-        selected_reference_indexes = all_reference_indexes[filtered_reference_cols]
-        reference_to_reduced = {idx_original: idx_reduced
-                                for idx_reduced, idx_original
-                                in enumerate(selected_reference_indexes)}
-
-        # ===================================================================
-        # PARTIE 2 : Analyse modale
-        # ===================================================================
-        lambda_, phi = eigh(K, M)
-        lambda_ = self.__checkEigVals(lambda_, dll_vec_reduced)
-
-        # Normalisation modale
-        modal_mass = np.diag(phi.T @ M @ phi)
-        phi = phi @ np.diag(1 / np.sqrt(modal_mass))
-
-        # Pulsations propres
-        omega_0 = np.sqrt(lambda_)
-
-        # Projection dans la base modale
-        Kb_phi = phi.T @ Kb
-        Cb_phi = phi.T @ Cb
-        Cphi = phi.T @ C @ phi
-
-        # Détection amortissement diagonal
-        non_diag_terms_norm = np.abs(Cphi - np.diag(np.diag(Cphi)))
-        diag_terms_booleen = np.isclose(non_diag_terms_norm, 0.0)
-        diag_damping = diag_terms_booleen.all()
-
-        xi = None
-        if diag_damping:
-            xi = np.diag(Cphi) / (2 * omega_0)
-            if print_damping:
-                print("=" * 40)
-                print("Damping factors")
-                for wi, ci in zip(omega_0, xi):
-                    print(f"ω0 = {wi:.4e} rad/s | ξ = {ci:.4e}")
-        elif print_damping:
-            non_zero_nondiag = non_diag_terms_norm[~diag_terms_booleen]
-            print("=" * 40)
-            print("Non diagonal damping coefficients :")
-            print(f"Average : {non_zero_nondiag.mean():.2e}")
-            print(f"Median : {np.median(non_zero_nondiag):.2e}")
-            print(f"Max : {np.max(non_zero_nondiag):.2e}")
-
-        # ===================================================================
-        # PARTIE 3 : Validation et mapping des indices input_output
-        # ===================================================================
-        if not isinstance(input_output, list) or len(input_output) == 0:
-            raise ValueError("'input_output' doit être une liste non vide de tuples "
-                             "(corps_ref, axe_ref, corps_libre, axe_libre).")
-
-        seen_pairs = set()
-        index_rows_freedof = []  # Indices dans l'espace freedof ORIGINAL
-        index_cols = []
-
-        for item in input_output:
-            # Validations de base
-            if not isinstance(item, (tuple, list)) or len(item) != 4:
-                raise ValueError(f"Chaque élément doit contenir 4 éléments "
-                                 f"(corps1, axe1, corps2, axe2). Reçu : {item}")
-
-            body1, axe1, body2, axe2 = item
-
-            if not isinstance(body1, str) or not isinstance(body2, str):
-                raise TypeError("Les noms de corps doivent être des chaînes.")
-
-            if not isinstance(axe1, int) or not isinstance(axe2, int):
-                raise TypeError("Les indices d'axes doivent être des entiers.")
-
-            if not (0 <= axe1 <= 5) or not (0 <= axe2 <= 5):
-                raise ValueError("Les indices d'axes doivent être entre 0 et 5.")
-
-            if body1 not in self.ref_body_index:
-                raise ValueError(f"'{body1}' n'est pas un corps de référence.")
-
-            if body2 not in self.body_index:
-                raise ValueError(f"'{body2}' n'est pas un corps libre.")
-
-            # ===============================================================
-            # Calcul des indices
-            # ===============================================================
-            id_ref = self.ref_body_index[body1]
-            id_body = self.body_index[body2]
-
-            # Indice dans l'espace de référence
-            index_ref_original = id_ref * 6 + axe1
-
-            # Indice dans l'espace des corps libres (freedof)
-            index_body_original = id_body * 6 + axe2
-
-            # ===============================================================
-            # Vérifications de disponibilité
-            # ===============================================================
-            axe_names = ["x", "y", "z", "θx", "θy", "θz"]
-
-            # Vérification corps de référence
-            if index_ref_original not in selected_reference_indexes:
-                raise ValueError(f"L'axe {axe_names[axe1]} du corps de référence '{body1}' "
-                                 f"n'a pas de couplage d'excitation (K et C nuls).")
-
-            # Vérification corps libre
-            if qr_decomposed:
-                # Interdire seulement les DDL totalement libres (unconstrained)
-                if index_body_original in self.__free_unconstrained_indices:
-                    raise ValueError(f"L'axe {axe_names[axe2]} du corps '{body2}' "
-                                     f"est totalement libre (non contraint). "
-                                     f"Pas de réponse fréquentielle définie.")
-                # Les DDL esclaves sont OK, ils seront reconstruits via T_qr_ff
-            else:
-                # Sans QR : vérifier que le DDL n'est pas filtré
-                if not filtered_rows[index_body_original]:
-                    raise ValueError(f"L'axe {axe_names[axe2]} du corps '{body2}' "
-                                     f"n'a pas de dynamique (K et C nuls).")
-
-            # Vérification duplication
-            pair_signature = (body1, axe1, body2, axe2)
-            if pair_signature in seen_pairs:
-                raise ValueError(f"Paire dupliquée détectée : {pair_signature}")
-            seen_pairs.add(pair_signature)
-
-            # Enregistrement des indices
-            index_rows_freedof.append(index_body_original)
-            index_cols.append(reference_to_reduced[index_ref_original])
-
-        # ===================================================================
-        # PARTIE 4 : Génération du vecteur de fréquences
-        # ===================================================================
-        if frequency_array is not None:
-            if not np.all(frequency_array > 0):
-                raise ValueError("'frequency_array' doit contenir uniquement des valeurs positives")
-            npoints = len(frequency_array)
-        elif (fstart is not None and fend is not None):
-            if not fstart > 0:
-                raise ValueError("'fstart' doit être positif")
-            if not fend > fstart:
-                raise ValueError("'fend' doit être supérieur à 'fstart'")
-            npoints = int(nbase * fend / fstart)
-            frequency_array = np.logspace(np.log10(fstart), np.log10(fend), npoints)
-        else:
-            # Plage automatique basée sur les fréquences propres
-            omega_positive = omega_0[omega_0 > 0]
-            if len(omega_positive) == 0:
-                raise ValueError("Aucune fréquence propre positive détectée. "
-                                 "Impossible de définir une plage automatique.")
-            fstart = 0.5 * omega_positive.min() / (2 * np.pi)
-            fend = 2.0 * omega_positive.max() / (2 * np.pi)
-            npoints = int(nbase * fend / fstart)
-            frequency_array = np.logspace(np.log10(fstart), np.log10(fend), npoints)
-
-        # ===================================================================
-        # PARTIE 5 : Calcul de la réponse fréquentielle
-        # ===================================================================
-        Gi_array = []
-        print_progress_step = int(print_progress_step) if print_progress_step is not None else 0
-        print_progress = print_progress_step > 0
-        progress_step = [npoints * r / 100 for r in range(0, 100, print_progress_step)] if print_progress else []
-
-        for i, wi in enumerate(frequency_array * 2 * np.pi):
-            if len(progress_step) > 0 and i > progress_step[0]:
-                print(f"     Progression >> {int(100 * i / npoints)} %")
-                progress_step.pop(0)
-
-            # Calcul dans l'espace modal
-            if diag_damping:
-                Hinv = np.diag(1 / (omega_0 ** 2 + 1j * wi * 2 * xi * omega_0 - wi ** 2))
-            else:
-                H = np.diag(omega_0 ** 2 - wi ** 2) + 1j * wi * Cphi
-                Hinv = np.linalg.inv(H)
-
-            # Réponse modale : shape (n_modes, n_excitations)
-            Gqi = Hinv @ (Kb_phi + 1j * wi * Cb_phi)
-
-            # Reconstruction dans l'espace de travail (masters_free ou filtered)
-            # Shape: (n_workspace, n_excitations)
-            Gi_workspace = phi @ Gqi
-
-            # ===============================================================
-            # Reconstruction dans l'espace freedof COMPLET
-            # ===============================================================
-            if qr_decomposed:
-                # Reconstruire TOUS les DDL free (masters + esclaves) via T_qr_ff
-                # T_qr_ff : (n_freedof, n_masters_free)
-                # Gi_workspace : (n_masters_free, n_excitations)
-                # → Gi_freedof : (n_freedof, n_excitations)
-                Gi_freedof = T_qr_ff @ Gi_workspace
-            else:
-                # Sans QR : reconstruire avec zéros pour les DDL filtrés
-                Gi_freedof = np.zeros((self._nbodies * 6, Gi_workspace.shape[1]),
-                                      dtype=complex)
-                Gi_freedof[selected_indexes, :] = Gi_workspace
-
-            # Extraction des DDL demandés par l'utilisateur
-            Gi_array.append(Gi_freedof[index_rows_freedof, index_cols])
-
-        Gi_array = np.array(Gi_array)
-
-        return MBSFrequencyDomainResult(frequency_array,
-                                        Gi_array,
-                                        input_output,
-                                        omega_0,
-                                        xi)
-
-    def ___ComputeFrequencyDomainResponse(self, input_output: List,
-                                       frequency_array: np.array = None,
-                                       fstart=None, fend=None,
-                                       print_damping=True,
-                                       print_progress_step: int = None,
-                                       nbase=20):
-        if not self._assembled:
-            self.AssemblyMatrixSystem()
-
-        if not self._check_linearity():
-            raise ValueError("Le système n'est pas totalement linéaire...")
-
-        dll_vec = self.__all_dll(reference=False)
 
         # ===================================================================
         # PARTIE 1 : Préparation des matrices
         # ===================================================================
         T_qr = self.__T_qr
         qr_decomposed = T_qr is not None
+
+
 
         if qr_decomposed:
             # Travailler dans l'espace QR réduit
-            K = T_qr.T @ self._Kff @ T_qr
-            C = T_qr.T @ self._Cff @ T_qr
-            M = T_qr.T @ self._Mff @ T_qr
+            Kqr = T_qr.T @ self._Kmatrix @ T_qr
+            Cqr = T_qr.T @ self._Cmatrix @ T_qr
+            Mqr = T_qr.T @ self._Mmatrix @ T_qr
 
-            # Filtrage des colonnes nulles
-            filtered_reference_cols = ~np.all((self._Kb == 0) & (self._Cb == 0), axis=0)
+            ff_selection = np.ix_(self.__qr_freedof, self.__qr_freedof)
+            fb_selection = np.ix_(self.__qr_freedof, self.__qr_fixeddof)
 
-            # Projection dans l'espace QR
-            Kb = T_qr.T @ self._Kb[:, filtered_reference_cols]
-            Cb = T_qr.T @ self._Cb[:, filtered_reference_cols]
+            T_qr_ff = T_qr[np.ix_(self._freedof, self.__qr_freedof)]
+            T_qr_fb = T_qr[np.ix_(self._freedof, self.__qr_fixeddof)]
 
-            dll_vec_reduced = dll_vec[self.__qr_master_indices]
+            K = Kqr[ff_selection]
+            C = Cqr[ff_selection]
+            M = Mqr[ff_selection]
+
+            Kb = Kqr[fb_selection]
+            Cb = Cqr[fb_selection]
+            Mb = Mqr[fb_selection]
+
+
+            reduced_dll = self.__all_dll(reference=True)[self.__master_freedof]
+            master_fixed_dll = self.__all_dll(reference=True, freebodies=True)[self.__master_fixeddof].tolist()
+
+
 
         else:
             # Sans QR : filtrer les DDL non contraints
-            filtered_rows = ~np.all((self._Kff == 0) & (self._Cff == 0), axis=0)
+            filtered_rows = ~np.all((self._Kff == 0) & (self._Cff == 0), axis=1)
             filtered_reference_cols = ~np.all((self._Kb == 0) & (self._Cb == 0), axis=0)
 
             K = self._Kff[filtered_rows][:, filtered_rows]
@@ -1674,25 +1476,23 @@ class MBSLinearSystem(__MBSBase):
 
             Kb = self._Kb[filtered_rows][:, filtered_reference_cols]
             Cb = self._Cb[filtered_rows][:, filtered_reference_cols]
+            Mb = np.zeros_like(Kb)
 
-            dll_vec_reduced = dll_vec[filtered_rows]
 
             # Mapping pour reconstruction
-            all_indexes = np.arange(self._nbodies * 6)
-            selected_indexes = all_indexes[filtered_rows]
+            computed_free_dof_indices = np.arange(self._nbodies * 6)[filtered_rows]
+            # Mapping pour les colonnes de référence
+            computed_fixed_dof_indices = np.arange(self._nrefbodies * 6)[filtered_reference_cols]
 
-        # Mapping pour les colonnes de référence
-        all_reference_indexes = np.arange(self._nrefbodies * 6)
-        selected_reference_indexes = all_reference_indexes[filtered_reference_cols]
-        reference_to_reduced = {idx_original: idx_reduced
-                                for idx_reduced, idx_original
-                                in enumerate(selected_reference_indexes)}
+            reduced_dll = self.__all_dll(reference=False)[computed_free_dof_indices]
+            master_fixed_dll = self.__all_dll(reference=True, freebodies=False).tolist()
 
+        fixed_dll = self.__all_dll(reference=True, freebodies=False)
         # ===================================================================
         # PARTIE 2 : Analyse modale
         # ===================================================================
         lambda_, phi = eigh(K, M)
-        lambda_ = self.__checkEigVals(lambda_, dll_vec_reduced)
+        lambda_ = self.__checkEigVals(lambda_, dll_vec = reduced_dll )
 
         # Normalisation modale
         modal_mass = np.diag(phi.T @ M @ phi)
@@ -1704,6 +1504,7 @@ class MBSLinearSystem(__MBSBase):
         # Projection dans la base modale
         Kb_phi = phi.T @ Kb
         Cb_phi = phi.T @ Cb
+        Mb_phi = phi.T @ Mb
         Cphi = phi.T @ C @ phi
 
         # Détection amortissement diagonal
@@ -1737,6 +1538,8 @@ class MBSLinearSystem(__MBSBase):
         index_rows_freedof = []  # Indices dans l'espace freedof ORIGINAL
         index_cols = []
 
+
+
         for item in input_output:
             # Validations de base
             if not isinstance(item, (tuple, list)) or len(item) != 4:
@@ -1766,27 +1569,11 @@ class MBSLinearSystem(__MBSBase):
             index_ref_original = id_ref * 6 + axe1
             index_body_original = id_body * 6 + axe2
 
-            # Vérifications de disponibilité
-            if index_ref_original not in selected_reference_indexes:
-                axe_names = ["x", "y", "z", "θx", "θy", "θz"]
-                raise ValueError(f"L'axe {axe_names[axe1]} du corps '{body1}' "
-                                 f"n'a pas de couplage d'excitation.")
+            ref_dll = fixed_dll[index_ref_original]
+            if ref_dll not in master_fixed_dll :
+                raise IndexError(f" Le dll '{ref_dll}' ne pilote pas la dynamique du mécanisme "
+                                 "et ne peut pas être sélectionné comme référence.")
 
-            # CORRECTION : Vérifier seulement que ce n'est pas un DDL totalement libre
-            if qr_decomposed:
-                # Interdire seulement les DDL totalement libres (unconstrained)
-                if index_body_original in self.__free_unconstrained_indices:
-                    axe_names = ["x", "y", "z", "θx", "θy", "θz"]
-                    raise ValueError(f"L'axe {axe_names[axe2]} du corps '{body2}' "
-                                     f"est totalement libre (non contraint). "
-                                     f"Pas de réponse fréquentielle définie.")
-                # Les esclaves sont OK, ils seront reconstruits par T_qr
-            else:
-                # Sans QR : vérifier dans filtered_rows
-                if not filtered_rows[index_body_original]:
-                    axe_names = ["x", "y", "z", "θx", "θy", "θz"]
-                    raise ValueError(f"L'axe {axe_names[axe2]} du corps '{body2}' "
-                                     f"n'a pas de dynamique.")
 
             # Vérification duplication
             pair_signature = (body1, axe1, body2, axe2)
@@ -1796,7 +1583,7 @@ class MBSLinearSystem(__MBSBase):
 
             # Enregistrer les indices dans l'espace freedof ORIGINAL
             index_rows_freedof.append(index_body_original)
-            index_cols.append(reference_to_reduced[index_ref_original])
+            index_cols.append(master_fixed_dll.index(ref_dll))
 
         # ===================================================================
         # PARTIE 4 : Génération du vecteur de fréquences
@@ -1832,6 +1619,7 @@ class MBSLinearSystem(__MBSBase):
                 progress_step.pop(0)
 
             # Calcul dans l'espace modal
+            W_excitation = (Kb_phi + 1j * wi * Cb_phi - wi**2 * Mb_phi)
             if diag_damping:
                 Hinv = np.diag(1 / (omega_0 ** 2 + 1j * wi * 2 * xi * omega_0 - wi ** 2))
             else:
@@ -1839,7 +1627,7 @@ class MBSLinearSystem(__MBSBase):
                 Hinv = np.linalg.inv(H)
 
             # Réponse modale
-            Gqi = Hinv @ (Kb_phi + 1j * wi * Cb_phi)
+            Gqi = Hinv @ W_excitation
 
             # Reconstruction dans l'espace de travail (QR réduit ou filtré)
             Gi_workspace = phi @ Gqi  # Shape: (n_workspace, n_excitations)
@@ -1847,11 +1635,11 @@ class MBSLinearSystem(__MBSBase):
             # CORRECTION CRITIQUE : Reconstruction dans l'espace freedof complet
             if qr_decomposed:
                 # Reconstruire TOUS les DDL (masters + esclaves) avec T_qr
-                Gi_freedof = T_qr @ Gi_workspace  # Shape: (n_freedof, n_excitations)
+                Gi_freedof = (T_qr_ff @ Gi_workspace + T_qr_fb)
             else:
                 # Sans QR : reconstruire avec zéros pour les DDL filtrés
-                Gi_freedof = np.zeros((self._nbodies * 6, Gi_workspace.shape[1]), dtype=complex)
-                Gi_freedof[selected_indexes, :] = Gi_workspace
+                Gi_freedof = np.zeros((self._nbodies * 6, self._nrefbodies * 6), dtype=complex)
+                Gi_freedof[np.ix_(computed_free_dof_indices, computed_fixed_dof_indices)] = Gi_workspace
 
             # Extraction des indices demandés dans l'espace freedof complet
             Gi_array.append(Gi_freedof[index_rows_freedof, index_cols])
@@ -1863,4 +1651,3 @@ class MBSLinearSystem(__MBSBase):
                                         input_output,
                                         omega_0,
                                         xi)
-
