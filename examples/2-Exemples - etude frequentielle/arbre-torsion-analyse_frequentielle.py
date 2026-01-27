@@ -12,10 +12,6 @@ ct1 = kt1 * 20/100
 ct2 = kt2 * 5/100
 ct3 = kt3 * 5/100
 
-t_span = [0, 30]
-t_eval = np.linspace(t_span[0], t_span[1], 1000)
-dt = t_eval[1] - t_eval[0]
-
 # Positions
 x1 = 0.01
 x2 = x1 + 0.01
@@ -58,11 +54,10 @@ for f in np.sort(natural_freq_theorique) :
     print(f">> f = {f:.5e} Hz")
 
 ## Etude avec MultibodySimulation
-import sys,socofer
-sys.path.append(socofer.devpy_ala_path)
+import sys
+sys.path.append("../..")
 from MultiBodySimulation.MBSBody import MBSRigidBody3D,MBSReferenceBody3D
-from MultiBodySimulation.MBSMechanicalJoint import (MBSLinkLinearSpringDamper,
-MBSLinkKinematic)
+from MultiBodySimulation.MBSMechanicalJoint import (MBSLinkLinearSpringDamper,)
 from MultiBodySimulation.MBSMechanicalSystem import MBSLinearSystem
 
 mecha_sys = MBSLinearSystem()
@@ -117,7 +112,6 @@ mecha_sys.AddLinkage(joint01)
 mecha_sys.AddLinkage(joint12)
 mecha_sys.AddLinkage(joint23)
 
-t_mbs, results = mecha_sys.RunDynamicSimulation(t_span, dt)
 
 natural_freq = mecha_sys.ComputeNaturalFrequencies(sort_values=True,
                                                     drop_zeros=True)
@@ -127,12 +121,6 @@ for f in natural_freq :
 
 
 
-mbs_modal_result = mecha_sys.ComputeModalAnalysis(sort_values = True,
-                                                            drop_zeros = True,)
-
-modal_result_dict = mbs_modal_result.GetDisplacementsByBodies()
-freq_vector_mbs = mbs_modal_result.GetNaturalFrequencies()
-
 
 freqres = mecha_sys.ComputeFrequencyDomainResponse([
             ("Ref", 3, "Masse 1", 3),
@@ -140,31 +128,35 @@ freqres = mecha_sys.ComputeFrequencyDomainResponse([
             ("Ref", 3, "Masse 3", 3),
                         ])
 
+G = freqres.SelectTransferFunctionObject_byLocId(None)
 
 print("=" * 40)
 print()
 ## Affichage des modes propres
 
-fig = plt.figure()
-ax = fig.add_subplot(111)
 
-color = []
-for i, mode in enumerate( phi_ ) :
-    l = ax.plot(natural_freq_theorique, np.rad2deg(mode), label=f"Theorique masse {i}",
-                    marker = "s",alpha = 0.5, ls="", markeredgecolor="k",ms=10)[0]
-    color.append( l.get_color() )
+plt.figure(figsize=(7,8))
+plt.subplot(311)
+plt.loglog(G.frequency, G.module, label = G.names)
+for w0 in freqres.GetNaturalFrequencies() :
+    plt.axvline(w0, color = "grey")
+plt.legend()
+plt.grid(True)
 
-k = 0
-for masse, mode in modal_result_dict.items() :
-    ax.plot(freq_vector_mbs, np.rad2deg(mode[3]), label=f"MBS : {masse}",
-                    marker = "o", ls = "", color=color[k])
-    k+=1
+plt.subplot(312)
+plt.semilogx(G.frequency, G.phase, label = G.names)
+for w0 in freqres.GetNaturalFrequencies() :
+    plt.axvline(w0, color = "grey")
+plt.legend()
+plt.grid(True)
 
-ax.grid()
-ax.set(title="Déplacements des modes propres",
-       xlabel = "Fréquence [Hz]",
-       ylabel = "Angle [°]")
+plt.subplot(313)
+plt.loglog(G.frequency, G.powerSpectralDensity, label = G.names)
+for w0 in freqres.GetNaturalFrequencies() :
+    plt.axvline(w0, color = "grey")
+plt.legend()
+plt.grid(True)
 
-
+plt.tight_layout()
 plt.show()
 
