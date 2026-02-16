@@ -242,7 +242,6 @@ class MBSScipyIVPSolver(MBSDynamicSolver):
 
     def solve(self, t_span: tuple, dt: float,
               method: str = "BDF",
-              print_step_rate: int = 0,
               max_angle_threshold: Optional[float] = None) -> tuple:
         """
         Intégration avec scipy.solve_ivp.
@@ -284,52 +283,22 @@ class MBSScipyIVPSolver(MBSDynamicSolver):
         else:
             jac = self.compute_jacobian  # Fonction appelée à chaque pas
 
-        # Configuration prints
-        if print_step_rate <= 1:
-            substep = 1
-            steps = np.array([0, nt], dtype=int)
-        else:
-            steps = np.unique([int(s) for s in np.linspace(0, nt, print_step_rate)])
-            substep = len(steps) - 1
+        sol = solve_ivp(
+            self.compute_derivative,
+            t_span,
+            Dy0,
+            method=method,
+            t_eval=t_eval,
+            jac=jac,
+        )
 
         # Allocation résultats
-        Dy = np.zeros((self.system._nbodies * 12, nt))
-        Dyfixed = np.zeros((self.system._nrefbodies * 12, nt))
-
-        # Boucle d'intégration
-        for k, (start_substep, end_substep) in enumerate(zip(steps[:-1], steps[1:]), start=1):
-            t_substep = t_eval[start_substep:end_substep]
-            t_span_sub = (t_substep[0], t_substep[-1])
-
-            # Intégration
-            sol = solve_ivp(
-                self.compute_derivative,
-                t_span_sub,
-                Dy0,
-                method=method,
-                t_eval=t_substep,
-                jac=jac,
-            )
-
-            # Stockage
-            Dyfixed[:, start_substep:end_substep - 1] = np.array([
+        Dy = sol.y
+        Dyfixed = np.array([
                 self.system._get_fixedBodies_displacement_state(ti)
-                for ti in t_substep[:-1]
+                for ti in t_eval
             ]).T
-            Dy[:, start_substep:end_substep - 1] = sol.y[:, :-1]
 
-            # Préparation pas suivant
-            Dy0 = sol.y[:, -1]
-
-            # Dernière itération
-            if k == substep:
-                Dy[:, -1] = Dy0
-                Dyfixed[:, -1] = self.system._get_fixedBodies_displacement_state(t_substep[-1])
-
-            # Progression
-            if print_step_rate > 1:
-                progress = k / substep * 100
-                print(f"Simulation: {progress:.1f}% ({k}/{substep})")
 
         # Vérification finale
         self._check_angle_validity(Dy[:, -1])

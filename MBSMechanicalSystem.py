@@ -771,7 +771,6 @@ class MBSLinearSystem(__MBSBase):
             return solver.solve(
                 t_span, dt,
                 method=ode_method,
-                print_step_rate=print_step_rate,
                 max_angle_threshold=max_angle_threshold
             )
 
