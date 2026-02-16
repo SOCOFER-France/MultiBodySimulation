@@ -2,6 +2,43 @@ import numpy as np
 from scipy.linalg import qr as QR_decomposition
 import warnings
 
+
+def ApproxRotationMatrix(theta_x, theta_y, theta_z):
+    """
+    Args:
+        theta_x (float): Angle de roulis (rotation autour de l'axe X).
+        theta_y (float): Angle de tangage (rotation autour de l'axe Y).
+        theta_z (float): Angle de lacet (rotation autour de l'axe Z).
+
+    Returns:
+        numpy.ndarray: Matrice de rotation 3x3.
+    """
+    # Matrice de rotation autour de l'axe X (roll)
+    R_x = np.array([
+        [1, 0, 0],
+        [0, 1, -theta_x],
+        [0, theta_x, 1]
+    ])
+
+    # Matrice de rotation autour de l'axe Y (pitch)
+    R_y = np.array([
+        [1, 0, theta_y],
+        [0, 1, 0],
+        [-theta_y, 0, 1]
+    ])
+
+    # Matrice de rotation autour de l'axe Z (yaw)
+    R_z = np.array([
+        [1, -theta_z, 0],
+        [theta_z, 1, 0],
+        [0, 0, 1]
+    ])
+
+    # Combinaison des rotations : R = R_z * R_y * R_x
+    R = np.dot(R_z, np.dot(R_y, R_x))
+
+    return R
+
 def RotationMatrix(theta_x, theta_y, theta_z):
     """
     Args:

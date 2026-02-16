@@ -4,7 +4,7 @@ import numpy as np
 from typing import List
 
 from MultiBodySimulation.MBSBody import MBSRigidBody3D
-from MultiBodySimulation.MBS_numerics import RotationMatrix
+from MultiBodySimulation.MBS_numerics import RotationMatrix, ApproxRotationMatrix
 
 class MBSBodySimulationResult :
     def __init__(self, body: MBSRigidBody3D,
@@ -34,7 +34,7 @@ class MBSBodySimulationResult :
         self.gamma = np.gradient(self.omega, self.time_eval, edge_order=2, axis=1)
 
 
-    def get_connected_point_motion(self,global_point):
+    def get_connected_point_motion(self,global_point, approx_rotation=False):
         """
         Calcul le déplacement, la vitesse et l'accélération d'un point appartenant au solide
         """
@@ -51,7 +51,10 @@ class MBSBodySimulationResult :
 
         for i in range(nt) :
             angles = self.angles[:,i]
-            R = RotationMatrix(*angles)
+            if approx_rotation :
+                R = ApproxRotationMatrix(*angles)
+            else :
+                R = RotationMatrix(*angles)
 
             point_x[:,i] = self.positions[:,i] + R @ local_point
             point_v[:,i] = self.positions[:,i] + np.cross(self.omega[:,i], R @ local_point)

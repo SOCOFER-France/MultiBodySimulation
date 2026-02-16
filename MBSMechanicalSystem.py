@@ -16,7 +16,7 @@ from MultiBodySimulation.MBS_numerics import (QR_validate_protected_masters,
                                                 QR_create_reordered_matrix,
                                               QR_decomposition,
                                               QR_protectedPivoting)
-
+from MultiBodySimulation.MBSDynamicSolver import MBSScipyIVPSolver
 
 class __MBSBase:
     """
@@ -732,111 +732,61 @@ class MBSLinearSystem(__MBSBase):
     def RunDynamicSimulation(self, t_span: tuple, dt: float,
                              ode_method: str = "BDF",
                              print_step_rate: int = 0,
-                             max_angle_threshold:(float|None) = None) -> tuple:
+                             max_angle_threshold: Optional[float] = None,
+                             solver_type: str = "scipy_ivp") -> tuple:
         """
         Lance la simulation dynamique du système.
 
-        Args:
-            t_span: Intervalle de temps (t_start, t_end)
-            dt: Pas de temps
-            ode_method: Méthode d'intégration ("BDF" ou "Radau")
-            print_step_rate: Nombre de prints pendant simulation (0 = désactivé)
+        Parameters
+        ----------
+        t_span : tuple
+            Intervalle (t_start, t_end)
+        dt : float
+            Pas de temps
+        ode_method : str
+            Méthode d'intégration ("BDF" ou "Radau")
+        print_step_rate : int
+            Prints de progression (0 = désactivé)
+        max_angle_threshold : float, optional
+            Seuil de validité angles [°]
+        solver_type : str
+            Type de solveur:
+            - "scipy_ivp" : scipy.solve_ivp (défaut, méthode actuelle)
+            - "qr_reduced" : Décomposition QR (À VENIR)
+            - "constraint_stabilized" : BDF2 + stabilisation (À VENIR)
 
-        Returns:
-            (t_eval, results): Vecteur temps et dictionnaire des résultats par corps
+        Returns
+        -------
+        t_eval : ndarray
+            Vecteur temps
+        results : dict
+            Résultats {nom_corps: MBSBodySimulationResult}
         """
-        self.__max_angle_threshold = max_angle_threshold
-
         if not self._assembled:
             self.AssemblyMatrixSystem()
 
-        # Génération du vecteur temps
-        nt = int(np.ceil((t_span[1] - t_span[0]) / dt)) + 1
-        t_eval = np.linspace(t_span[0], t_span[1], nt)
-
-        # État initial
-        t0 = t_eval[0]
-        Dy0 = self._get_bodies_initial_displacement()
-        self._check_angle_validity(Dy0)
-
-        # Jacobienne (constante si pas de gap)
-        if self._n_gapLink == 0:
-            jac = self._approxJacobian()
-        else:
-            jac = self._approxJacobian  # Fonction appelée à chaque pas
-
-        # Configuration des prints
-        if print_step_rate <= 1:
-            substep = 1
-            steps = np.array([0, nt], dtype=int)
-        else:
-            steps = np.unique([int(s) for s in np.linspace(0, nt, print_step_rate)])
-            substep = len(steps) - 1
-
-        # Allocation mémoire pour résultats
-        Dy = np.zeros((self._nbodies * 12, nt))
-        Dyfixed = np.zeros((self._nrefbodies * 12, nt))
-
-        # Boucle d'intégration (par sous-intervalles si print activé)
-        for k, (start_substep, end_substep) in enumerate(zip(steps[:-1], steps[1:]), start=1):
-            t_substep = t_eval[start_substep:end_substep]
-            t_span_sub = (t_substep[0], t_substep[-1])
-
-            # Intégration
-            sol = solve_ivp(
-                self._IVP_derivativeFunc,
-                t_span_sub,
-                Dy0,
+        # Sélection du solveur
+        if solver_type == "scipy_ivp":
+            solver = MBSScipyIVPSolver(self)
+            return solver.solve(
+                t_span, dt,
                 method=ode_method,
-                t_eval=t_substep,
-                jac=jac,
+                print_step_rate=print_step_rate,
+                max_angle_threshold=max_angle_threshold
             )
 
-            # Stockage des résultats
-            Dyfixed[:, start_substep:end_substep - 1] = np.array([
-                self._get_fixedBodies_displacement_state(ti) for ti in t_substep[:-1]
-            ]).T
-            Dy[:, start_substep:end_substep - 1] = sol.y[:, :-1]
+        # elif solver_type == "qr_reduced":
+        #     solver = MBSQRReducedSolver(self)
+        #     return solver.solve(t_span, dt, **kwargs)
+        #
+        # elif solver_type == "constraint_stabilized":
+        #     solver = MBSConstraintStabilizedSolver(self)
+        #     return solver.solve(t_span, dt, **kwargs)
 
-            # Préparation pas suivant
-            Dy0 = sol.y[:, -1]
-
-            # Dernière itération
-            if k == substep:
-                Dy[:, -1] = Dy0
-                Dyfixed[:, -1] = self._get_fixedBodies_displacement_state(t_substep[-1])
-
-            # Print progression
-            if print_step_rate > 1:
-                progress = k / substep * 100
-                print(f"Simulation: {progress:.1f}% ({k}/{substep})")
-
-        # Vérification finale de validité des angles
-        self._check_angle_validity(Dy[:, -1])
-
-        # Reconstruction des positions absolues
-        y = self._recompose_body_position(Dy)
-        yfixed = self._recompose_ref_body_position(Dyfixed)
-
-        # Construction du dictionnaire de résultats
-        result_dict = {}
-
-        for body in self.ref_bodies:
-            idx = self.ref_body_index[body.GetName]
-            Dy_body = Dyfixed[6 * idx:6 * (idx + 1)]
-            y_body = yfixed[6 * idx:6 * (idx + 1)]
-            v_body = Dyfixed[6 * self._nrefbodies + 6 * idx:6 * self._nrefbodies + 6 * (idx + 1)]
-            result_dict[body.GetName] = MBSBodySimulationResult(
-                body, t_eval, Dy_body, y_body, v_body
-            )
-
-        for body in self.bodies:
-            idx = self.body_index[body.GetName]
-            Dy_body = Dy[6 * idx:6 * (idx + 1)]
-            y_body = y[6 * idx:6 * (idx + 1)]
-            v_body = Dy[6 * self._nbodies + 6 * idx:6 * self._nbodies + 6 * (idx + 1)]
-            result_dict[body.GetName] = MBSBodySimulationResult(
-                body, t_eval, Dy_body, y_body, v_body
+        else:
+            raise ValueError(
+                f"Solveur inconnu: '{solver_type}'. "
+                "Choix: 'scipy_ivp', 'qr_reduced', 'constraint_stabilized'"
             )
 
         return t_eval, result_dict
