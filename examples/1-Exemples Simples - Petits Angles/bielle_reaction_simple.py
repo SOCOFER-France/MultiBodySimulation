@@ -3,7 +3,7 @@ import matplotlib.pyplot as plt
 from scipy.integrate import solve_ivp
 
 import sys, socofer
-sys.path.append(socofer.lib_socofer_path)
+sys.path.append(socofer.devpy_ala_path)
 
 from MultiBodySimulation.MBSBody import MBSRigidBody3D, MBSReferenceBody3D
 from MultiBodySimulation.MBSMechanicalJoint import (MBSLinkLinearSpringDamper,
@@ -162,9 +162,8 @@ t_start = time.time()
 t_mbs, results = sys_mbs.RunDynamicSimulation(
     t_span=t_span,
     dt=dt,
-    ode_method="BDF",
-    max_angle_threshold=15.0  # Alerte si > 15°
-)
+    solver_type = "constraint_stabilized")
+
 t_end = time.time()
 
 print(f"\nTemps de calcul : {t_end - t_start:.3f} s")
@@ -173,7 +172,7 @@ print(f"\nTemps de calcul : {t_end - t_start:.3f} s")
 bielle_results = results["Bielle"]
 theta_mbs = bielle_results.angles[2]
 # Position de l'extrémité (reconstruction)
-ext_mbs = bielle_results.get_connected_point_motion([L,0,0])
+ext_mbs = bielle_results.get_connected_point_motion([L,0,0], approx_rotation=False)
 y_ext_mbs = ext_mbs.positions[1]
 x_ext_mbs = ext_mbs.positions[0]
 

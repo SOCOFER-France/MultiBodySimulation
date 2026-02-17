@@ -16,7 +16,7 @@ from MultiBodySimulation.MBS_numerics import (QR_validate_protected_masters,
                                                 QR_create_reordered_matrix,
                                               QR_decomposition,
                                               QR_protectedPivoting)
-from MultiBodySimulation.MBSDynamicSolver import MBSScipyIVPSolver
+from MultiBodySimulation.MBSDynamicSolver import MBSScipyIVPSolver, MBSConstraintStabilizedSolver
 
 class __MBSBase:
     """
@@ -260,6 +260,9 @@ class MBSLinearSystem(__MBSBase):
         self._Cmat_linkage = np.zeros((6 * self._nlinks, 6 * self._nlinks))
         self._Kmat_kinematic = np.zeros((6 * self._nlinks, 6 * self._nlinks))
 
+        # Liaisons cinématiques pures
+        _Kmat_cin =  np.zeros((6 * self._nlinks, 6 * self._nlinks))
+
         # Cataloguer les liaisons par type
         self._non_linear_link = []
         self._linear_link = []
@@ -365,7 +368,7 @@ class MBSLinearSystem(__MBSBase):
 
             if link.IsKinematic :
                 self.__n_kinematic_links += 1
-                self._Kmat_kinematic[s_linkage, s_linkage] += link.GetConstraintMatrix()
+                _Kmat_cin[s_linkage, s_linkage] += link.GetConstraintMatrix()
                 # GetConstrainMatrix >> diagonal avec 1 si dll local bloqué
 
 
@@ -381,6 +384,10 @@ class MBSLinearSystem(__MBSBase):
         # Matrices globales K et C
         self._Kmatrix = self._Pmat_linkage @ self._Kmat_linkage @ self._Qmat_linkage
         self._Cmatrix = self._Pmat_linkage @ self._Cmat_linkage @ self._Qmat_linkage
+
+        self._Kmat_kinematic = _Kmat_cin
+        self._Kmat_kinematic_penal = self._Pmat_linkage @ _Kmat_cin @ self._Qmat_linkage
+
 
     def _assemble_mass_matrix(self):
         """Assemble la matrice de masse globale."""
@@ -429,6 +436,13 @@ class MBSLinearSystem(__MBSBase):
         self._Pgap_b = self._Pmat_gap[self._fixeddof]
         self._Qgap_f = self._Qmat_gap[:, self._freedof]
         self._Qgap_b = self._Qmat_gap[:, self._fixeddof]
+
+
+        # Cinématique
+        Kmat_kin = self._Kmat_kinematic_penal[self._freedof]
+        positive_rows = (np.abs(Kmat_kin) > 0).any(axis=1)
+        self._Kkin_f = Kmat_kin[positive_rows][:, self._freedof]
+        self._Kkin_b = Kmat_kin[positive_rows][:, self._fixeddof]
 
 
 
@@ -730,10 +744,9 @@ class MBSLinearSystem(__MBSBase):
         return Agap_penal + self._Jac_linear
 
     def RunDynamicSimulation(self, t_span: tuple, dt: float,
-                             ode_method: str = "BDF",
-                             print_step_rate: int = 0,
                              max_angle_threshold: Optional[float] = None,
-                             solver_type: str = "scipy_ivp") -> tuple:
+                             solver_type: str = "scipy_ivp",
+                             **solver_kwargs) -> tuple:
         """
         Lance la simulation dynamique du système.
 
@@ -752,9 +765,7 @@ class MBSLinearSystem(__MBSBase):
         solver_type : str
             Type de solveur:
             - "scipy_ivp" : scipy.solve_ivp (défaut, méthode actuelle)
-            - "qr_reduced" : Décomposition QR (À VENIR)
-            - "constraint_stabilized" : BDF2 + stabilisation (À VENIR)
-
+            - "constraint_stabilized" : BDF2 + stabilisation
         Returns
         -------
         t_eval : ndarray
@@ -770,17 +781,12 @@ class MBSLinearSystem(__MBSBase):
             solver = MBSScipyIVPSolver(self)
             return solver.solve(
                 t_span, dt,
-                method=ode_method,
                 max_angle_threshold=max_angle_threshold
             )
 
-        # elif solver_type == "qr_reduced":
-        #     solver = MBSQRReducedSolver(self)
-        #     return solver.solve(t_span, dt, **kwargs)
-        #
-        # elif solver_type == "constraint_stabilized":
-        #     solver = MBSConstraintStabilizedSolver(self)
-        #     return solver.solve(t_span, dt, **kwargs)
+        elif solver_type == "constraint_stabilized":
+            solver = MBSConstraintStabilizedSolver(self)
+            return solver.solve(t_span, dt, **solver_kwargs)
 
         else:
             raise ValueError(

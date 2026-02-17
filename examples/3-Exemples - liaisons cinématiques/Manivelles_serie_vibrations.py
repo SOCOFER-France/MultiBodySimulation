@@ -3,7 +3,7 @@
 import numpy as np
 import matplotlib.pyplot as plt
 from scipy.integrate import solve_ivp
-
+import time
 from Manivelles_serie_param import *
 
 t_final = 25
@@ -97,10 +97,14 @@ RefBody1.SetRotationFunction(dtheta_z_func = theta0_sig)
 print(f"Configuration : dt = {dt} s, {n_steps} pas de temps")
 print("Simulation en cours...")
 
+t1 = time.time()
 t_mbs, results_mbs = mecha_sys.RunDynamicSimulation(
     t_span=[0, t_final],
     dt=dt,
 )
+t2 = time.time()
+print("Elapsed time: ", t2-t1)
+
 
 print("Simulation MBS terminée !")
 

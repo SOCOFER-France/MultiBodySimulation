@@ -69,7 +69,7 @@ t_scipy = sol.t
 
 ## Etude avec MultibodySimulation
 import sys,socofer
-sys.path.append(socofer.lib_socofer_path)
+sys.path.append(socofer.devpy_ala_path)
 from MultiBodySimulation.MBSBody import MBSRigidBody3D,MBSReferenceBody3D
 from MultiBodySimulation.MBSMechanicalJoint import MBSLinkLinearSpringDamper
 from MultiBodySimulation.MBSMechanicalSystem import MBSLinearSystem
@@ -128,7 +128,7 @@ mecha_sys.AddLinkage(joint01)
 mecha_sys.AddLinkage(joint12)
 mecha_sys.AddLinkage(joint23)
 
-t_mbs, results = mecha_sys.RunDynamicSimulation(t_span, dt)
+t_mbs, results = mecha_sys.RunDynamicSimulation(t_span, dt, solver_type = "constraint_stabilized")
 
 theta1_mbs = results["Masse 1"].angles[0]
 theta2_mbs = results["Masse 2"].angles[0]

@@ -1,7 +1,7 @@
 import numpy as np
 import matplotlib.pyplot as plt
 from scipy.interpolate import interp1d
-
+import time
 import sys
 import socofer
 sys.path.append(socofer.devpy_ala_path)
@@ -62,10 +62,14 @@ excitation_roue_12.SetDisplacementFunction(dz_func = dz_func_12)
 excitation_roue_21.SetDisplacementFunction(dz_func = dz_func_21)
 excitation_roue_22.SetDisplacementFunction(dz_func = dz_func_22)
 
-
+t1 = time.time()
 t_eval, results = mecha_sys.RunDynamicSimulation(t_span=[0, simu_duration],
                                                  dt=1e-3,
+                                                 solver_type="constraint_stabilized",
                                 )
+t2 = time.time()
+print("Elapsed time: ", t2-t1)
+
 # Extraction des résultats
 caisse_results = results["Caisse"]
 essieu_1_results = results["Essieu 1"]
