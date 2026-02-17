@@ -34,7 +34,7 @@ class MBSBodySimulationResult :
         self.gamma = np.gradient(self.omega, self.time_eval, edge_order=2, axis=1)
 
 
-    def get_connected_point_motion(self,global_point, approx_rotation=False):
+    def get_connected_point_motion(self,global_point, approx_rotation=True):
         """
         Calcul le déplacement, la vitesse et l'accélération d'un point appartenant au solide
         """
@@ -57,7 +57,7 @@ class MBSBodySimulationResult :
                 R = RotationMatrix(*angles)
 
             point_x[:,i] = self.positions[:,i] + R @ local_point
-            point_v[:,i] = self.positions[:,i] + np.cross(self.omega[:,i], R @ local_point)
+            point_v[:,i] = self.velocities[:,i] + np.cross(self.omega[:,i], R @ local_point)
             if i > 0 :
                 point_acc[:,i] = (point_v[:,i] - point_v[:,i-1]) / (self.time_eval[i] - self.time_eval[i-1])
 
@@ -188,9 +188,9 @@ class MBSFrequencyDomainResult :
         self.__naturalPulsations = natural_pulsations
         self.__dampingFactor = damping_factor
 
-        self.__transfer_function_names = [ f"{body2}::{self.__index_to_axe[axe2]} / {body1}::{self.__index_to_axe[axe1]} "
+        self.__transfer_function_names = [ f"{body2}::{self.__index_to_axe[axe2]} / {body1}::{self.__index_to_axe[axe1]}"
                                            for body1,axe1,body2,axe2 in self.__input_output_list ]
-        self.__transfer_function_symbols = [ f"{self.__index_to_axe[axe2]} / {self.__index_to_axe[axe1]} "
+        self.__transfer_function_symbols = [ f"{self.__index_to_axe[axe2]} / {self.__index_to_axe[axe1]}"
                                             for _, axe1, _, axe2 in self.__input_output_list]
 
         self.__nf = len(self.__transfer_function_names)

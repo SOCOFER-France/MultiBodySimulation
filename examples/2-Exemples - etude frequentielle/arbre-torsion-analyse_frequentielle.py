@@ -53,6 +53,58 @@ print("Fréquences propres du système (théorie) : ")
 for f in np.sort(natural_freq_theorique) :
     print(f">> f = {f:.5e} Hz")
 
+## Calcul théorique de la réponse fréquentielle :
+
+def compute_amplitude_phase(H):
+    amplitude = np.abs(H)
+    phase = np.angle(H)
+    phase = np.unwrap(phase) * 180/np.pi
+    return amplitude, phase-phase[0]
+
+
+# Définition de la plage de fréquences
+freq_min = 0.1  # Hz
+freq_max = 1.0  # Hz
+n_freq = 1000
+frequencies = np.logspace(np.log10(freq_min), np.log10(freq_max), n_freq)
+omega = 2 * np.pi * frequencies  # Pulsations [rad/s]
+
+# Fonction de transfert : H(ω) = [(-ω²M + iωC + K)]^(-1) * (iωCb + Kb)
+# Cette fonction donne la réponse des DDL libres à une excitation sur le DDL fixe
+
+n_dof_free = len(freedof)
+n_dof_fixed = len(fixeddof)
+n_freq = len(frequencies)
+
+# Initialisation des fonctions de transfert
+H_theorique = np.zeros((n_dof_free, n_dof_fixed, n_freq), dtype=complex)
+
+for i, w in enumerate(omega):
+    # Matrice de raideur dynamique
+    Z = -w ** 2 * Mf + 1j * w * Cf + Kf
+
+    # Second membre (excitation)
+    F_exc = 1j * w * Cb + Kb
+
+    # Résolution : H(ω) = Z^(-1) * F_exc
+    H_theorique[:, :, i] = np.linalg.solve(Z, F_exc)
+
+# Extraction des fonctions de transfert individuelles
+# H_theorique[i, 0, :] correspond à la réponse du DDL libre i+1 à l'excitation du DDL 0
+H1_theorique = H_theorique[0, 0, :]  # Masse 1
+H2_theorique = H_theorique[1, 0, :]  # Masse 2
+H3_theorique = H_theorique[2, 0, :]  # Masse 3
+
+amp1, phase1 = compute_amplitude_phase(H1_theorique)
+amp2, phase2 = compute_amplitude_phase(H2_theorique)
+amp3, phase3 = compute_amplitude_phase(H3_theorique)
+
+# Calcul de la PSD (Power Spectral Density)
+# PSD = |H(ω)|²
+psd1 = amp1**2
+psd2 = amp2**2
+psd3 = amp3**2
+
 ## Etude avec MultibodySimulation
 import sys, socofer
 sys.path.append(socofer.lib_socofer_path)
@@ -136,34 +188,51 @@ print()
 
 
 plt.figure(figsize=(7,8))
+
 plt.subplot(311)
-plt.loglog(G.frequency, G.module, label = G.names)
-for w0 in freqres.GetNaturalFrequencies() :
-    plt.axvline(w0, color = "grey")
-plt.title("Réponse 'Amplitude'")
+plt.title("Réponse 'Amplitude' - Comparaison MBS vs Théorie")
+# Résultats MBS
+plt.loglog(G.frequency, G.module, label=G.names, linestyle='--', linewidth=2)
+# Résultats théoriques
+plt.loglog(frequencies, amp1, label='Masse 1 (théorie)', linestyle='-', alpha=0.7)
+plt.loglog(frequencies, amp2, label='Masse 2 (théorie)', linestyle='-', alpha=0.7)
+plt.loglog(frequencies, amp3, label='Masse 3 (théorie)', linestyle='-', alpha=0.7)
+for w0 in freqres.GetNaturalFrequencies():
+    plt.axvline(w0, color="grey", alpha=0.5)
 plt.ylabel(r"$|H(\omega)|$")
-plt.legend()
+plt.legend(fontsize=8)
 plt.grid(True)
 
 plt.subplot(312)
-plt.title("Réponse 'Phase'")
-plt.semilogx(G.frequency, G.phase, label = G.names)
-for w0 in freqres.GetNaturalFrequencies() :
-    plt.axvline(w0, color = "grey")
-plt.ylabel(r"$\phi_(H) (\omega)$ [°]")
+plt.title("Réponse 'Phase' - Comparaison MBS vs Théorie")
+# Résultats MBS
+plt.semilogx(G.frequency, G.phase, label=G.names, linestyle='--', linewidth=2)
+# Résultats théoriques
+plt.semilogx(frequencies, phase1, label='Masse 1 (théorie)', linestyle='-', alpha=0.7)
+plt.semilogx(frequencies, phase2, label='Masse 2 (théorie)', linestyle='-', alpha=0.7)
+plt.semilogx(frequencies, phase3, label='Masse 3 (théorie)', linestyle='-', alpha=0.7)
+for w0 in freqres.GetNaturalFrequencies():
+    plt.axvline(w0, color="grey", alpha=0.5)
+plt.ylabel(r"$\phi_H(\omega)$ [°]")
+plt.legend(fontsize=8)
 plt.grid(True)
 
 plt.subplot(313)
-plt.title("Réponse 'Power Spectral Density'")
-plt.loglog(G.frequency, G.powerSpectralDensity, label = G.names)
-for w0 in freqres.GetNaturalFrequencies() :
-    plt.axvline(w0, color = "grey")
-plt.ylabel(r"$PSD_(H) (\omega)|$")
+plt.title("Réponse 'Power Spectral Density' - Comparaison MBS vs Théorie")
+# Résultats MBS
+plt.loglog(G.frequency, G.powerSpectralDensity, label=G.names, linestyle='--', linewidth=2)
+# Résultats théoriques
+plt.loglog(frequencies, psd1, label='Masse 1 (théorie)', linestyle='-', alpha=0.7)
+plt.loglog(frequencies, psd2, label='Masse 2 (théorie)', linestyle='-', alpha=0.7)
+plt.loglog(frequencies, psd3, label='Masse 3 (théorie)', linestyle='-', alpha=0.7)
+for w0 in freqres.GetNaturalFrequencies():
+    plt.axvline(w0, color="grey", alpha=0.5)
+plt.ylabel(r"$PSD_H(\omega)$")
+plt.legend(fontsize=8)
 plt.grid(True)
 
 plt.xlabel("Freq (Hz)")
 plt.tight_layout()
-if __name__ == "__main__" :
-    plt.savefig("freq_response.png")
+if __name__ == "__main__":
+    plt.savefig("freq_response_comparison.png")
 plt.show()
-

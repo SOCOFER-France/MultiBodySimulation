@@ -25,9 +25,9 @@ H_boite = 200e-3 # hauteur et largeur de boite
 Ly_roue = 1435e-3
 
 K_spring = 1200e3 # N/m
-C_spring = K_spring * 0.01 #1%
+C_spring = K_spring * 0.001 #1%
 K_lat_spring = 1500
-C_lat_spring = K_lat_spring * 0.01
+C_lat_spring = K_lat_spring * 0.001
 
 rho = 7800 # densité acier
 
