@@ -6,14 +6,11 @@ import sys
 import socofer
 sys.path.append(socofer.devpy_ala_path)
 
-from Vehicle_essieux_parametrage import (mecha_sys,
-                                         excitation_roue_11,excitation_roue_12,
-                                         excitation_roue_21, excitation_roue_22,
-                                         boite_11)
+from Vehicle_essieux_parametrage import prepare_study
 
 from vibrationSignalPSD import psd2time, compute_PSD, build_PSD_61373_amplitudes
 
-simu_duration = 1.0 # s
+simu_duration = 5.0 # s
 f1 = 10
 fstart = 20
 fend = 100
@@ -21,7 +18,10 @@ f2 = 200
 asd_amp = 8.74
 
 
-
+(mecha_sys,
+ excitation_roue_11,excitation_roue_12,
+ excitation_roue_21, excitation_roue_22,
+ boite_11) = prepare_study(1e-6)
 
 psd_func = build_PSD_61373_amplitudes(asd_amp, fstart, fend)
 spec = np.array([[f1,  psd_func(f1)],
@@ -62,11 +62,15 @@ excitation_roue_12.SetDisplacementFunction(dz_func = dz_func_12)
 excitation_roue_21.SetDisplacementFunction(dz_func = dz_func_21)
 excitation_roue_22.SetDisplacementFunction(dz_func = dz_func_22)
 
+mecha_sys.ComputeQrDecomposedSystem()
+
 t1 = time.time()
 t_eval, results = mecha_sys.RunDynamicSimulation(t_span=[0, simu_duration],
                                                  dt=1e-3,
                                                  solver_type="constraint_stabilized",
-                                                 stabilization_method="Lagrangian",
+                                                 stabilization_method="SmoothLagrangian",
+                                                 print_steps = 10,
+                                                 print_inner_iter = False
                                 )
 t2 = time.time()
 print("Elapsed time: ", t2-t1)

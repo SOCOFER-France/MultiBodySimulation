@@ -102,7 +102,8 @@ t_mbs, results_mbs = mecha_sys.RunDynamicSimulation(
     t_span=[0, t_final],
     dt=dt,
     solver_type="constraint_stabilized",
-    stabilization_method="SmoothLagrangian",
+    stabilization_method="Lagrangian",
+    print_steps = 25,
 )
 t2 = time.time()
 print("Elapsed time: ", t2-t1)

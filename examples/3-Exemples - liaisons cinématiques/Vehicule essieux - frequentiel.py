@@ -6,12 +6,15 @@ import sys
 import socofer
 sys.path.append(socofer.devpy_ala_path)
 
-from Vehicle_essieux_parametrage import (mecha_sys,
-                                         excitation_roue_11,excitation_roue_12,
-                                         excitation_roue_21, excitation_roue_22,
-                                         boite_11)
+from Vehicle_essieux_parametrage import prepare_study
 
 
+
+
+(mecha_sys,
+ excitation_roue_11,excitation_roue_12,
+ excitation_roue_21, excitation_roue_22,
+ boite_11) = prepare_study(1e-5)
 
 natural_freq = mecha_sys.ComputeNaturalFrequencies(sort_values=True,
                                                     drop_zeros=True,)

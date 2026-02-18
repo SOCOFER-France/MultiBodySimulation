@@ -1,11 +1,10 @@
 import numpy as np
 from typing import Optional,Tuple
 
-import pypardiso
+import time
 from scipy.sparse import csc_matrix, eye, bmat
 from scipy.integrate import solve_ivp
-from scipy.linalg import solve as lin_solver
-from scipy.sparse.linalg import lgmres
+from scipy.sparse.linalg import spsolve as lin_solver
 
 pypardiso_installed = False
 try :
@@ -515,7 +514,7 @@ class MBSConstraintStabilizedSolver(MBSDynamicSolver):
     def __init__(self, system: 'MBSLinearSystem',
                  atol: float = 1e-6,
                  tol: float =1e-6,
-                 maxInnerIter: int = 15,
+                 maxInnerIter: int = 50,
                  inner_atol = 1e-8,
                  inner_tol = 1e-8,):
 
@@ -527,6 +526,16 @@ class MBSConstraintStabilizedSolver(MBSDynamicSolver):
         self.tol = float(tol)
         self.maxIter = int(maxInnerIter)
 
+        self.__init_linear()
+        self.__init_lagrangian()
+
+        if self.system.isLinear() :
+            self.maxIter = 1
+            self.relax = 1.0
+        else :
+            self.relax = 0.95
+
+    def __init_linear(self):
         n = 6 * self.system._nbodies
         A = np.zeros((2 * n, 2 * n))
         A[:n, n:] = np.eye(n)
@@ -537,43 +546,39 @@ class MBSConstraintStabilizedSolver(MBSDynamicSolver):
         self.bF_linear = np.zeros((2 * n, n))
         self.bF_linear[n:,] = self.system._invMff
 
-        Kkin_f = self.system._Kkin_f
+
+
+    def __init_lagrangian(self):
+        n = 6 * self.system._nbodies
+
+        Kkin_f = self.system._Lkin_f
         self.ncons = Kkin_f.shape[0]
         if self.ncons > 0 :
-            Kkin_b = self.system._Kkin_b
+            # Contraintes cinématiques :
+            # Lkin_f @ X_f + Lkin_b @ X_b = 0
+            Lkin_b = self.system._Lkin_b
 
-            Jkin_f = np.zeros((self.ncons, 2 * n))
-            Jkin_f[:, :n] = Kkin_f
+            Jkin_f = np.zeros((2 * self.ncons, 2 * n))
+            Jkin_f[:self.ncons, :n] = Kkin_f
+            Jkin_f[self.ncons:, n:] = Kkin_f
 
             nref = self.system._nrefbodies * 6
-            Jkin_b = np.zeros((self.ncons, 2 * nref))
+            Jkin_b = np.zeros((2 * self.ncons, 2 * nref))
 
-            Jkin_b[:, :nref] = Kkin_b
+            Jkin_b[:self.ncons, :nref] = Lkin_b
+            Jkin_b[self.ncons:, nref:] = Lkin_b
 
             self.Jkin_f = csc_matrix(Jkin_f)
             self.Jkin_b = Jkin_b
 
-    def polynomialExtrapolator(self, tnp1, tprev, xprev):
 
-        if len(tprev) < 3:
-            return xprev[0]
-
-        t = tprev[:3]
-        x = xprev[:3]
-
-        # Interpolation de Lagrange à l'ordre 2 (3 points)
-        def L(k):
-            idx = [i for i in range(3) if i != k]
-            return ((tnp1 - t[idx[0]]) * (tnp1 - t[idx[1]])) / ((t[k] - t[idx[0]]) * (t[k] - t[idx[1]]))
-
-        xnp1 = sum(x[k] * L(k) for k in range(3))
-        return xnp1
 
     def solve(self, t_span: tuple, dt: float,
               max_angle_threshold: Optional[float] = None,
               adaptative = False,
               stabilization_method: (str,None) = "Lagrangian",
-              print_iter = False,
+              print_inner_iter = False,
+              print_steps: (int, None) = 0
               ) -> tuple:
         """
         Intégration avec scipy.solve_ivp.
@@ -599,6 +604,7 @@ class MBSConstraintStabilizedSolver(MBSDynamicSolver):
             Résultats par corps {nom: MBSBodySimulationResult}
         """
 
+        print_steps = int(print_steps) if print_steps is not None  else 0
         stabilization_method = "" if stabilization_method is None else stabilization_method
 
         self._max_angle_threshold = max_angle_threshold
@@ -639,11 +645,27 @@ class MBSConstraintStabilizedSolver(MBSDynamicSolver):
             dh = dt
 
         if self.ncons > 0:
-            Flambda_n = np.zeros(self.ncons, dtype = float)
+            Flambda_n = np.zeros( 2* self.ncons, dtype = float)
 
         i = 0
+        nstep_print = 0
+        next_print_ti = nstep_print * (t_span[1] - t_span[0])/(print_steps + 1)
+        timer_start = time.time()
+        cumul_inner_res = 0.
+        cumul_inner_iter = 0
         while t_eval[i] < t_span[1]:
-
+            if t_eval[i] >= next_print_ti and i>=1 and print_steps > 0 :
+                timer_step = time.time()
+                elapsed = timer_step - timer_start
+                timer_ratio  = (t_span[1] - t_span[0]) / (t_eval[i] - t_span[0])
+                remaining = elapsed *( timer_ratio - 1 )
+                progress = 100 / timer_ratio
+                print(f"Solving BF2  {progress:.2f} % ::"
+                      f" Elapsed Time {elapsed:.3f} s - Remaining Time Est. {remaining:.3f} s"
+                      f" - Avg. inner res {cumul_inner_res/i:.3e} - Avg. inner iter {cumul_inner_iter/i:.1f}"
+                      f" - Avg. timestep {t_eval[i]/i:.3e} s")
+                nstep_print += 1
+                next_print_ti = nstep_print * (t_span[1] - t_span[0]) / (print_steps + 1)
             # Capacité dépassée ? Doubler la taille
             if i + 1 >= n_estimate:
                 Dy = np.hstack([Dy, np.zeros_like(Dy)])
@@ -660,45 +682,48 @@ class MBSConstraintStabilizedSolver(MBSDynamicSolver):
 
 
             if self.ncons > 0 and stabilization_method == "Lagrangian":
-                Dynp1, Dyfixed_np1, Flambda_n = self._BDF2_Lagrangian(tnp1,
+                Dynp1, Dyfixed_np1, Flambda_n, inner_res, inner_iter = self._BDF2_Lagrangian(tnp1,
                                                                       tn,
                                                                       tm,
                                                                       Dy_predict,
                                                                       Dy_n,
                                                                       Dy_m,
                                                                       Flambda_n,
-                                                                      print_iter=print_iter,
+                                                                      print_iter=print_inner_iter,
                                                                       max_iter=self.maxIter)
-            elif self.ncons > 0 and stabilization_method == "SmoothLagrangian" :
-                Dynp1, Dyfixed_np1 = self._BDF2_step(tnp1,
+                if self.ncons > 0 and stabilization_method == "SmoothLagrangian":
+                    Dynp1, Dyfixed_np1, inner_res, inner_iter = self._BDF2_step(tnp1,
+                                                                                tn,
+                                                                                tm,
+                                                                                Dy_predict,
+                                                                                Dy_n,
+                                                                                Dy_m,
+                                                                                print_iter=False,
+                                                                                max_iter=min(self.maxIter-3, 1))
+                    cumul_inner_res += inner_res
+                    cumul_inner_iter += inner_iter
+                    Dynp1, Dyfixed_np1, Flambda_n, inner_res, inner_iter = self._BDF2_Lagrangian(tnp1,
+                                                                 tn,
+                                                                 tm,
+                                                                 Dynp1,
+                                                                 Dy_n,
+                                                                 Dy_m,
+                                                                 Flambda_n,
+                                                                 Dyfixed = Dyfixed_np1,
+                                                                 print_iter=print_inner_iter,
+                                                                 max_iter=min(self.maxIter, 3))
+            else :
+                Dynp1, Dyfixed_np1,inner_res, inner_iter = self._BDF2_step(tnp1,
                                                      tn,
                                                      tm,
                                                      Dy_predict,
                                                      Dy_n,
                                                      Dy_m,
-                                                     print_iter=False,
+                                                     print_iter = print_inner_iter,
                                                      max_iter=self.maxIter)
-                Dynp1, Dyfixed_np1, Flambda_n = self._BDF2_Lagrangian(tnp1,
-                                                              tn,
-                                                              tm,
-                                                              Dynp1,
-                                                              Dy_n,
-                                                              Dy_m,
-                                                              Flambda_n,
-                                                              Dyfixed_np1,
-                                                              print_iter = print_iter,
-                                                              max_iter=10)
 
-            else :
-                Dynp1, Dyfixed_np1 = self._BDF2_step(tnp1,
-                                                 tn,
-                                                 tm,
-                                                 Dy_predict,
-                                                 Dy_n,
-                                                 Dy_m,
-                                              print_iter = print_iter,
-                                              max_iter=self.maxIter)
-
+            cumul_inner_res += inner_res
+            cumul_inner_iter += inner_iter
             err_old = err
             err = np.linalg.norm(Dynp1 - Dy_predict) / (self.atol + self.tol * np.linalg.norm(Dynp1))
 
@@ -733,6 +758,32 @@ class MBSConstraintStabilizedSolver(MBSDynamicSolver):
         results = self._build_results_dict(t_eval, Dy, y, Dyfixed, yfixed)
 
         return t_eval, results
+
+    def compute_non_linear_jac(self, Amat_lin, Dy, Dyref):
+
+            # Sans gap, jacobienne constante
+            if self.system._n_gapLink == 0:
+                return Amat_lin
+
+            n = 6 * self.system._nbodies
+            u = Dy[:n]
+
+            ub = Dyref[:6 * self.system._nrefbodies]
+
+            du = (self.system._Qgap_f @ u + self.system._Qgap_b @ ub)
+
+            # Détection gaps activés
+            phi0 = (np.maximum(0, du - self.system._gapPlus) +
+                    np.minimum(0, du - self.system._gapMinus))
+            s_phi = 1.0 * (phi0 > 0) + 1.0 * (phi0 < 0)
+            Pf = self.system._Pgap_f * s_phi[np.newaxis]
+
+            # Contribution gap à la jacobienne
+            Agap = np.zeros((2 * n, 2 * n))
+            Agap[n:, :n] = -self.system._invMff @ (Pf @ (self.system._Kmat_gap @ self.system._Qgap_f))
+            Agap[n:, n:] = -self.system._invMff @ (Pf @ (self.system._Cmat_gap @ self.system._Qgap_f))
+
+            return csc_matrix(Agap) + Amat_lin
 
 
     def compute_forces(self, Uvec: np.ndarray, Vvec: np.ndarray,
@@ -769,9 +820,9 @@ class MBSConstraintStabilizedSolver(MBSDynamicSolver):
                        self.system._Qmat_linkage[:, self.system._fixeddof] @ Vfixed)
             F += self._compute_nonlinear_forces(dUlocal, dVlocal)
 
-        # Forces de contact gap
-        if self.system._n_gapLink > 0:
-            F += self._compute_gap_forces(Uvec, Vvec, Ufixed, Vfixed)
+        # # Forces de contact gap
+        # if self.system._n_gapLink > 0:
+        #     F += self._compute_gap_forces(Uvec, Vvec, Ufixed, Vfixed)
 
         return F
 
@@ -794,7 +845,8 @@ class MBSConstraintStabilizedSolver(MBSDynamicSolver):
         #x_next = alpha * f(..) + beta
         Bvec = Dy_n * beta_n + Dy_m * beta_m
         Fnp1 = self.compute_forces(Uvec, Vvec, Ufixed, Vfixed)
-        Amat = eye(2 * n, format = "csc") - alpha * self._Jac_linear
+        Jac_mat = self.compute_non_linear_jac(self._Jac_linear, Dy, Dyfixed)
+        Amat = eye(2 * n, format = "csc") - alpha * Jac_mat
 
         b = alpha * self.bF_linear @ Fnp1 + Bvec
         r =  Amat @ Dy - b
@@ -813,12 +865,17 @@ class MBSConstraintStabilizedSolver(MBSDynamicSolver):
             Vvec = Dy[n:]
             Fnp1 = self.compute_forces(Uvec, Vvec, Ufixed, Vfixed)
             b = alpha * self.bF_linear @ Fnp1 + Bvec
+
+            if self.system._n_gapLink > 0 :
+                Jac_mat = self.compute_non_linear_jac(self._Jac_linear, Dy, Dyfixed)
+                Amat = eye(2 * n, format="csc") - alpha * self._Jac_linear
+
             r = Amat @ Dy - b
             res = np.linalg.norm(r / scale) / (self.inner_atol + tol)
 
         if print_iter :
             print(f"time = {tnp1:.3f}, iter = {iter}, res = {res:.3e}")
-        return Dy, Dyfixed
+        return Dy, Dyfixed, res, iter
 
     def _BDF2_Lagrangian(self, tnp1: float, tn: float, tm: float,
                          Dy: np.ndarray, Dy_n: np.ndarray, Dy_m: np.ndarray,
@@ -843,11 +900,15 @@ class MBSConstraintStabilizedSolver(MBSDynamicSolver):
         #x_next = alpha * f(..) + beta
         Bvec = Dy_n * beta_n + Dy_m * beta_m
         Fnp1 = self.compute_forces(Uvec, Vvec, Ufixed, Vfixed)
-        Amat_lin = eye(2 * n, format = "csc") - alpha * self._Jac_linear
 
-        Amat = bmat([[Amat_lin, alpha * self.Jkin_f.T],
+        Jac_mat = self.compute_non_linear_jac(self._Jac_linear, Dy, Dyfixed)
+
+        Amat_lin = eye(2 * n, format = "csc") - alpha * Jac_mat
+
+        Amat = bmat([[Amat_lin, self.Jkin_f.T],
                            [self.Jkin_f, None]],
                     format = "csc")
+
 
         bDyn = alpha * self.bF_linear @ Fnp1 + Bvec
         bCons = - self.Jkin_b @ Dyfixed
@@ -867,13 +928,23 @@ class MBSConstraintStabilizedSolver(MBSDynamicSolver):
         while res > 1.0 and iter < max_iter  :
             iter += 1
 
-            Dz = linearSolver(Amat, b)
+            Dz = linearSolver(Amat, b) * self.relax + (1-self.relax) * Dz
 
             Uvec = Dz[:n]
             Vvec = Dz[n:2*n]
             Fnp1 = self.compute_forces(Uvec, Vvec, Ufixed, Vfixed)
             bDyn = alpha * self.bF_linear @ Fnp1 + Bvec
             b[:2*n] = bDyn
+
+            if self.system._n_gapLink > 0 :
+                Jac_mat = self.compute_non_linear_jac(self._Jac_linear, Dy, Dyfixed)
+
+                Amat_lin = eye(2 * n, format="csc") - alpha * Jac_mat
+
+                Amat = bmat([[Amat_lin, self.Jkin_f.T],
+                             [self.Jkin_f, None]],
+                            format="csc")
+
             r = Amat @ Dz - b
 
             res = np.linalg.norm(r / scale) / (self.inner_atol + tol)
@@ -886,6 +957,10 @@ class MBSConstraintStabilizedSolver(MBSDynamicSolver):
         Flambda_n = Dz[2*n:]
 
         if print_iter :
-            print(f"time = {tnp1:.3f}, iter = {iter}, res = {res:.3e}")
+            Alin_cond = np.linalg.cond(Amat_lin.todense())
+            Acond = np.linalg.cond(Amat.todense())
+            Jkin_cond = np.linalg.cond(self.Jkin_f.todense())
+            print(f"time = {tnp1:.3f}, iter = {iter}, res = {res:.3e}, "
+                  f"matrix cond. = {Acond:.3e}, matrix lin. cond. = {Alin_cond:.3e}, constraints cond. = {Jkin_cond:.3e}")
 
-        return Dy, Dyfixed, Flambda_n
+        return Dy, Dyfixed, Flambda_n, res, iter

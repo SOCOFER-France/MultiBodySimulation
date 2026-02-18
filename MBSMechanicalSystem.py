@@ -210,7 +210,7 @@ class MBSLinearSystem(__MBSBase):
 
         self.__max_angle_threshold: Optional[float] = None
 
-        self.__T_qr = None
+        self._T_qr = None
         self.__qr_master_indices = None
         self.__free_unconstrained_indices = None
 
@@ -386,7 +386,7 @@ class MBSLinearSystem(__MBSBase):
         self._Cmatrix = self._Pmat_linkage @ self._Cmat_linkage @ self._Qmat_linkage
 
         self._Kmat_kinematic = _Kmat_cin
-        self._Kmat_kinematic_penal = self._Pmat_linkage @ _Kmat_cin @ self._Qmat_linkage
+        self._Lmat_kinConstraints =  _Kmat_cin @ self._Qmat_linkage
 
 
     def _assemble_mass_matrix(self):
@@ -439,10 +439,10 @@ class MBSLinearSystem(__MBSBase):
 
 
         # Cinématique
-        Kmat_kin = self._invMff @ (self._Kmat_kinematic_penal[self._freedof])
-        positive_rows = (np.abs(Kmat_kin) > 0).any(axis=1)
-        self._Kkin_f = Kmat_kin[positive_rows][:, self._freedof]
-        self._Kkin_b = Kmat_kin[positive_rows][:, self._fixeddof]
+        Kmat_kin = self._Lmat_kinConstraints
+        positive_rows = (np.abs(Kmat_kin) > 1e-5).any(axis=1)
+        self._Lkin_f = Kmat_kin[positive_rows][:, self._freedof]
+        self._Lkin_b = Kmat_kin[positive_rows][:, self._fixeddof]
 
 
 
@@ -596,6 +596,9 @@ class MBSLinearSystem(__MBSBase):
         return True
 
 
+    def isLinear(self):
+        if self._assembled :
+            return len(self._non_linear_link) == 0 and self._n_gapLink == 0
 
     def _IVP_derivativeFunc(self, t: float, Dy: np.ndarray) -> np.ndarray:
         """
@@ -1123,11 +1126,11 @@ class MBSLinearSystem(__MBSBase):
                                                if i in self._freedof])
 
         # Stockage
-        self.__T_qr = T_qr
+        self._T_qr = T_qr
         self.__qr_master_indices = master_indices_global
         self.__free_unconstrained_indices = free_unconstrained_indices
-        self.__qr_freedof = qr_freedof
-        self.__qr_fixeddof = qr_fixeddof
+        self._qr_freedof = qr_freedof
+        self._qr_fixeddof = qr_fixeddof
         self.__master_freedof = master_freedof
         self.__master_fixeddof = master_fixeddof
 
@@ -1220,13 +1223,13 @@ class MBSLinearSystem(__MBSBase):
         # ===================================================================
         # BRANCHE 1 : Avec décomposition QR (espace réduit des maîtres)
         # ===================================================================
-        use_qr = self.__T_qr is not None
+        use_qr = self._T_qr is not None
         if use_qr :
-            K_qr = self.__T_qr.T @ self._Kmatrix @ self.__T_qr
-            M_qr = self.__T_qr.T @ self._Mmatrix @ self.__T_qr
+            K_qr = self._T_qr.T @ self._Kmatrix @ self._T_qr
+            M_qr = self._T_qr.T @ self._Mmatrix @ self._T_qr
 
-            K = K_qr[np.ix_(self.__qr_freedof, self.__qr_freedof)]
-            M = M_qr[np.ix_(self.__qr_freedof, self.__qr_freedof)]
+            K = K_qr[np.ix_(self._qr_freedof, self._qr_freedof)]
+            M = M_qr[np.ix_(self._qr_freedof, self._qr_freedof)]
 
             # Vecteur des DDL maîtres free
             dll_vec = self.__all_dll(reference=True)[self.__master_freedof]
@@ -1285,18 +1288,18 @@ class MBSLinearSystem(__MBSBase):
         # ===================================================================
         # BRANCHE 1 : Avec décomposition QR (espace réduit des maîtres)
         # ===================================================================
-        use_qr = self.__T_qr is not None
+        use_qr = self._T_qr is not None
         if use_qr:
-            K_qr = self.__T_qr.T @ self._Kmatrix @ self.__T_qr
-            M_qr = self.__T_qr.T @ self._Mmatrix @ self.__T_qr
+            K_qr = self._T_qr.T @ self._Kmatrix @ self._T_qr
+            M_qr = self._T_qr.T @ self._Mmatrix @ self._T_qr
 
-            K = K_qr[np.ix_(self.__qr_freedof, self.__qr_freedof)]
-            M = M_qr[np.ix_(self.__qr_freedof, self.__qr_freedof)]
+            K = K_qr[np.ix_(self._qr_freedof, self._qr_freedof)]
+            M = M_qr[np.ix_(self._qr_freedof, self._qr_freedof)]
 
             # Vecteur des DDL maîtres free
             dll_vec = self.__all_dll(reference=True)[self.__master_freedof]
 
-            T_qr_ff = self.__T_qr[np.ix_(self._freedof, self.__qr_freedof)]
+            T_qr_ff = self._T_qr[np.ix_(self._freedof, self._qr_freedof)]
 
 
         # ===================================================================
@@ -1389,7 +1392,7 @@ class MBSLinearSystem(__MBSBase):
         # ===================================================================
         # PARTIE 1 : Préparation des matrices
         # ===================================================================
-        T_qr = self.__T_qr
+        T_qr = self._T_qr
         qr_decomposed = T_qr is not None
 
 
@@ -1400,11 +1403,11 @@ class MBSLinearSystem(__MBSBase):
             Cqr = T_qr.T @ self._Cmatrix @ T_qr
             Mqr = T_qr.T @ self._Mmatrix @ T_qr
 
-            ff_selection = np.ix_(self.__qr_freedof, self.__qr_freedof)
-            fb_selection = np.ix_(self.__qr_freedof, self.__qr_fixeddof)
+            ff_selection = np.ix_(self._qr_freedof, self._qr_freedof)
+            fb_selection = np.ix_(self._qr_freedof, self._qr_fixeddof)
 
-            T_qr_ff = T_qr[np.ix_(self._freedof, self.__qr_freedof)]
-            T_qr_fb = T_qr[np.ix_(self._freedof, self.__qr_fixeddof)]
+            T_qr_ff = T_qr[np.ix_(self._freedof, self._qr_freedof)]
+            T_qr_fb = T_qr[np.ix_(self._freedof, self._qr_fixeddof)]
 
             K = Kqr[ff_selection]
             C = Cqr[ff_selection]
