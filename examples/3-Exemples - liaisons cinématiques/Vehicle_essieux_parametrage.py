@@ -7,13 +7,16 @@ import socofer
 sys.path.append(socofer.devpy_ala_path)
 
 from MultiBodySimulation.MBSBody import MBSRigidBody3D,MBSReferenceBody3D
-from MultiBodySimulation.MBSMechanicalJoint import MBSLinkLinearSpringDamper, MBSLinkKinematic
+from MultiBodySimulation.MBSMechanicalJoint import MBSLinkLinearSpringDamper, MBSLinkKinematic, MBSLinkHardStop
 from MultiBodySimulation.MBSMechanicalSystem import MBSLinearSystem
 
 
 
+def prepare_study(kinematic_tolerance = 1e-4,
+                  include_butee = False,
+                  tol_penetration = 1e-9,
+                  e_butee = 5e-3):
 
-def prepare_study(kinematic_tolerance = 1e-4):
 
     Lx_loco = 16.0 # Longueur totale
     Hz_loco = 1.0
@@ -218,6 +221,36 @@ def prepare_study(kinematic_tolerance = 1e-4):
                             stiffness = Kmat,
                             damping = Cmat)
 
+    if include_butee :
+        butee_boite_11 = MBSLinkHardStop(boite_11,
+                               boite_11.GetReferencePosition(),
+                                       caisse_loco,
+                               boite_11.GetReferencePosition(),
+                               Tz_gap = (-e_butee, e_butee),
+                               penetration_tolerance = tol_penetration
+                                                   )
+        butee_boite_12 = MBSLinkHardStop(boite_12,
+                               boite_12.GetReferencePosition(),
+                                       caisse_loco,
+                               boite_12.GetReferencePosition(),
+                               Tz_gap = (-e_butee, e_butee),
+                               penetration_tolerance = tol_penetration
+                                                   )
+        butee_boite_21 = MBSLinkHardStop(boite_21,
+                               boite_21.GetReferencePosition(),
+                                       caisse_loco,
+                               boite_21.GetReferencePosition(),
+                               Tz_gap = (-e_butee, e_butee),
+                               penetration_tolerance = tol_penetration
+                                                   )
+        butee_boite_22 = MBSLinkHardStop(boite_22,
+                               boite_22.GetReferencePosition(),
+                                       caisse_loco,
+                               boite_22.GetReferencePosition(),
+                               Tz_gap = (-e_butee, e_butee),
+                               penetration_tolerance = tol_penetration
+                                                   )
+
 
     # Assemblage
     mecha_sys = MBSLinearSystem()
@@ -250,6 +283,12 @@ def prepare_study(kinematic_tolerance = 1e-4):
     mecha_sys.AddLinkage( ressort_2_boite_21 )
     mecha_sys.AddLinkage( ressort_1_boite_22 )
     mecha_sys.AddLinkage( ressort_2_boite_22 )
+
+    if include_butee :
+        mecha_sys.AddLinkage( butee_boite_11 )
+        mecha_sys.AddLinkage( butee_boite_12 )
+        mecha_sys.AddLinkage( butee_boite_21 )
+        mecha_sys.AddLinkage( butee_boite_22 )
 
     mecha_sys.CheckUnconstrainedDegreeOfFreedom()
 

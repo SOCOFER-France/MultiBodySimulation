@@ -10,7 +10,7 @@ from Vehicle_essieux_parametrage import prepare_study
 
 from vibrationSignalPSD import psd2time, compute_PSD, build_PSD_61373_amplitudes
 
-simu_duration = 5.0 # s
+simu_duration = 0.5 # s
 f1 = 10
 fstart = 20
 fend = 100
@@ -18,23 +18,31 @@ f2 = 200
 asd_amp = 8.74
 dt = 5e-4
 
+include_butee = True
+e_butee = 2e-3
+
 algo1 = "constraint_stabilized"
 algo2 = "constraint_stabilized"
 
 method1 = ""
-method2 = "Lagrangian"
+method2 = "Lagrange"
 
 label1 = "BDF2 - pénalisation"
 label2 = "BDF2 - Lagrange"
 
-tol1 = 1e-9
+tol1 = 1e-6
 tol2 = 1000
 
-adaptative = False
+adaptative = True
+
+
+
 (mecha_sys,
  excitation_roue_11,excitation_roue_12,
  excitation_roue_21, excitation_roue_22,
- boite_11) = prepare_study(tol1)
+ boite_11) = prepare_study(tol1,
+                           include_butee = include_butee,
+                           e_butee=e_butee,)
 
 psd_func = build_PSD_61373_amplitudes(asd_amp, fstart, fend)
 spec = np.array([[f1,  psd_func(f1)],
@@ -95,7 +103,9 @@ t1 = time.time()
 (mecha_sys,
  excitation_roue_11,excitation_roue_12,
  excitation_roue_21, excitation_roue_22,
- boite_11) = prepare_study(tol2)
+ boite_11) = prepare_study(tol2,
+                           include_butee = include_butee,
+                           e_butee=e_butee,)
 
 excitation_roue_11.SetDisplacementFunction(dz_func = dz_func_11)
 excitation_roue_12.SetDisplacementFunction(dz_func = dz_func_12)
@@ -107,7 +117,7 @@ t_eval_scipy, results_scipy = mecha_sys.RunDynamicSimulation(t_span=[0, simu_dur
                                                  dt = dt,
                                                  solver_type = algo2,
                                                  stabilization_method = method2,
-                                                 adaptative = False,
+                                                 adaptative = adaptative,
                                                  print_steps = 10,
                                                  print_inner_iter = False
                                 )
@@ -282,27 +292,25 @@ plt.tight_layout()
 
 plt.figure()
 
-error_thetax = (essieu_1_boite11_results.angles[0] - boite_11_results.angles[0])
-error_thetaz = (essieu_1_boite11_results.angles[2] - boite_11_results.angles[2])
-error_thetax_scipy = (essieu_1_boite11_results_scipy.angles[0] - boite_11_results_scipy.angles[0])
-error_thetaz_scipy = (essieu_1_boite11_results_scipy.angles[2] - boite_11_results_scipy.angles[2])
+dz_boite11 = results["Boite 11"].positions[2] - results["Caisse"].get_connected_point_motion(boite_11.GetReferencePosition()).positions[2]
 
 plt.subplot(211)
-plt.title(label1)
-plt.plot(t_eval, error_thetax, color='b', linewidth=1.5, label = "Erreur angle X")
-plt.plot(t_eval, error_thetax, color="r", linewidth=1.5, label = "Erreur angle Z")
-plt.grid()
-plt.xlabel("Temps [s]")
-plt.ylabel("Angles [rad]")
-plt.legend()
+plt.plot(t_eval, dz_boite11, label = "Boite 11", linewidth=1.5)
+plt.xlabel('Temps [s]', fontsize=10)
+plt.ylabel('Position [mm]', fontsize=10)
+plt.legend(fontsize=9)
+plt.grid(True)
+
+dz_boite11 = results_scipy["Boite 11"].positions[2] - results_scipy["Caisse"].get_connected_point_motion(boite_11.GetReferencePosition()).positions[2]
+
 
 plt.subplot(212)
 plt.title(label2)
-plt.plot(t_eval_scipy, error_thetax_scipy, color='b', linewidth=1.5, label = "Erreur angle X")
-plt.plot(t_eval_scipy, error_thetaz_scipy, color="r", linewidth=1.5, label = "Erreur angle Z")
-plt.grid()
-plt.xlabel("Temps [s]")
-plt.ylabel("Angles [rad]")
-plt.legend()
+plt.plot(t_eval_scipy, dz_boite11, label = "Boite 11", linewidth=1.5)
+plt.xlabel('Temps [s]', fontsize=10)
+plt.ylabel('Position [mm]', fontsize=10)
+plt.legend(fontsize=9)
+plt.grid(True)
+
 
 plt.show()
