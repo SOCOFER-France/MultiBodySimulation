@@ -64,15 +64,17 @@ class MBSBodySimulationResult :
         return MBSDistantPointMotionResults(self.time_eval,
                                             point_x,
                                             point_v,
-                                            point_acc)
+                                            point_acc,
+                                            self.angles)
 
 class MBSDistantPointMotionResults :
 
-    def __init__(self, time_eval, positions, velocities, accelerations):
+    def __init__(self, time_eval, positions, velocities, accelerations, angles):
         self.time_eval = time_eval
         self.positions = positions
         self.velocities = velocities
         self.accelerations = accelerations
+        self.angles = angles
 
 
 class MBSModalResults :

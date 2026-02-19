@@ -386,7 +386,7 @@ class MBSLinearSystem(__MBSBase):
         self._Cmatrix = self._Pmat_linkage @ self._Cmat_linkage @ self._Qmat_linkage
 
         self._Kmat_kinematic = _Kmat_cin
-        self._Lmat_kinConstraints =  _Kmat_cin @ self._Qmat_linkage
+        self._Lmat_kinConstraints = _Kmat_cin @ self._Qmat_linkage
 
 
     def _assemble_mass_matrix(self):

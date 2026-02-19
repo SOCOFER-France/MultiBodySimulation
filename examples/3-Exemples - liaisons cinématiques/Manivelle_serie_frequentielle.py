@@ -8,7 +8,7 @@ from Manivelles_serie_param import *
 
 # Définition de la plage de fréquences
 freq_min = 0.3  # Hz
-freq_max = 150.0  # Hz
+freq_max = 350.0  # Hz
 n_freq = 1000
 frequencies = np.logspace(np.log10(freq_min), np.log10(freq_max), n_freq)
 omega = 2 * np.pi * frequencies  # Pulsations [rad/s]
@@ -17,8 +17,8 @@ n_dof = 2
 H_base_theo = np.zeros((n_dof, n_freq), dtype=complex)
 
 
-Kb = np.array([[kx1*L1_b1**2,0] ,[0,kx1*L1_b1**2]])
-Cb = np.array([[cx1*L1_b1**2,0] ,[0,cx1*L1_b1**2]])
+Kb = np.array([[kx1 * L1_b1,0] ,[0,kx2 * L2_b2]])
+Cb = np.array([[cx1 * L1_b1,0] ,[0,cx2 * L2_b2]])
 print("Calcul en cours...")
 for i, w in enumerate(omega):
     # Matrice de raideur dynamique
@@ -65,8 +65,8 @@ print("Configuration : Excitation sur Reference 1 (rotation Rz)")
 # - θ2 / θ_ref1 : réponse de Manivelle_2 à une rotation de Reference 1
 
 spec = [
-    ("Reference 1", 5, "Manivelle_1", 5),  # θ1 / θ_ref1
-    ("Reference 1", 5, "Manivelle_2", 5),  # θ2 / θ_ref1
+    ("Reference 1", 0, "Manivelle_1", 5),  # θ1 / θ_ref1
+    ("Reference 1", 0, "Manivelle_2", 5),  # θ2 / θ_ref1
 ]
 freqres = mecha_sys.ComputeFrequencyDomainResponse(spec,
                                                    fstart=freq_min,
@@ -75,8 +75,8 @@ freqres = mecha_sys.ComputeFrequencyDomainResponse(spec,
 print("Calcul MBS terminé !")
 
 
-G_theta1_ref1 = freqres.SelectTransferFunctionObject_byName('Manivelle_1::θz / Reference 1::θz')
-G_theta2_ref1 = freqres.SelectTransferFunctionObject_byName('Manivelle_2::θz / Reference 1::θz')
+G_theta1_ref1 = freqres.SelectTransferFunctionObject_byName('Manivelle_1::θz / Reference 1::x')
+G_theta2_ref1 = freqres.SelectTransferFunctionObject_byName('Manivelle_2::θz / Reference 1::x')
 
 
 mecha_sys.ComputeQrDecomposedSystem(print_infos=True,
@@ -101,8 +101,8 @@ freqres_QR = mecha_sys.ComputeFrequencyDomainResponse(spec,
                                                    fstart=freq_min,
                                                    fend=freq_max,)
 
-G_theta1_ref1_QR = freqres_QR.SelectTransferFunctionObject_byName('Manivelle_1::θz / Reference 1::θz')
-G_theta2_ref1_QR = freqres_QR.SelectTransferFunctionObject_byName('Manivelle_2::θz / Reference 1::θz')
+G_theta1_ref1_QR = freqres_QR.SelectTransferFunctionObject_byName('Manivelle_1::θz / Reference 1::x')
+G_theta2_ref1_QR = freqres_QR.SelectTransferFunctionObject_byName('Manivelle_2::θz / Reference 1::x')
 
 
 fig, axes = plt.subplots(3, 2, figsize=(9, 7))
@@ -120,8 +120,8 @@ axes[0, 0].loglog(G_theta1_ref1.frequency, G_theta1_ref1.module, 'r--',
 axes[0, 0].loglog(G_theta1_ref1_QR.frequency, G_theta1_ref1_QR.module, 'green',
                   label='MBS QR', linewidth=1.5, alpha=0.8)
 
-axes[0, 0].set_ylabel(r'$|H_{θ_1/θ_{ref1}}(\omega)|$')
-axes[0, 0].set_title(r'FRF : $θ_1 / θ_{ref1}$ - Amplitude')
+axes[0, 0].set_ylabel(r'$|H_{θ_1/X_{ref1}}(\omega)|$')
+axes[0, 0].set_title(r'FRF : $θ_1 / X_{ref1}$ - Amplitude')
 axes[0, 0].legend()
 axes[0, 0].grid(True, alpha=0.3)
 
@@ -133,7 +133,7 @@ axes[1, 0].semilogx(G_theta1_ref1_QR.frequency, G_theta1_ref1_QR.phase, 'green',
                     linewidth=1.5, alpha=0.8, label='MBS QR')
 
 axes[1, 0].set_ylabel(r'Phase [°]')
-axes[1, 0].set_title(r'FRF : $θ_1 / θ_{ref1}$ - Phase')
+axes[1, 0].set_title(r'FRF : $θ_1 / X_{ref1}$ - Phase')
 axes[1, 0].legend()
 axes[1, 0].grid(True, alpha=0.3)
 
@@ -146,7 +146,7 @@ axes[2, 0].loglog(G_theta1_ref1_QR.frequency, G_theta1_ref1_QR.powerSpectralDens
 
 axes[2, 0].set_xlabel('Fréquence [Hz]')
 axes[2, 0].set_ylabel(r'PSD')
-axes[2, 0].set_title(r'FRF : $θ_1 / θ_{ref1}$ - PSD')
+axes[2, 0].set_title(r'FRF : $θ_1 / X_{ref1}$ - PSD')
 axes[2, 0].legend()
 axes[2, 0].grid(True, alpha=0.3)
 
@@ -162,8 +162,8 @@ axes[0, 1].loglog(G_theta2_ref1.frequency, G_theta2_ref1.module, 'r--',
 axes[0, 1].loglog(G_theta2_ref1_QR.frequency, G_theta2_ref1_QR.module, 'green',
                   label='MBS QR', linewidth=1.5, alpha=0.8)
 
-axes[0, 1].set_ylabel(r'$|H_{θ_2/θ_{ref1}}(\omega)|$')
-axes[0, 1].set_title(r'FRF : $θ_2 / θ_{ref1}$ - Amplitude')
+axes[0, 1].set_ylabel(r'$|H_{θ_2/X_{ref1}}(\omega)|$')
+axes[0, 1].set_title(r'FRF : $θ_2 / X_{ref1}$ - Amplitude')
 axes[0, 1].legend()
 axes[0, 1].grid(True, alpha=0.3)
 
@@ -175,7 +175,7 @@ axes[1, 1].semilogx(G_theta2_ref1_QR.frequency, G_theta2_ref1_QR.phase, 'green',
                     linewidth=1.5, alpha=0.8, label='MBS QR')
 
 axes[1, 1].set_ylabel(r'Phase [°]')
-axes[1, 1].set_title(r'FRF : $θ_2 / θ_{ref1}$ - Phase')
+axes[1, 1].set_title(r'FRF : $θ_2 / X_{ref1}$ - Phase')
 axes[1, 1].legend()
 axes[1, 1].grid(True, alpha=0.3)
 
@@ -188,7 +188,7 @@ axes[2, 1].loglog(G_theta2_ref1_QR.frequency, G_theta2_ref1_QR.powerSpectralDens
 
 axes[2, 1].set_xlabel('Fréquence [Hz]')
 axes[2, 1].set_ylabel(r'PSD')
-axes[2, 1].set_title(r'FRF : $θ_2 / θ_{ref1}$ - PSD')
+axes[2, 1].set_title(r'FRF : $θ_2 / X_{ref1}$ - PSD')
 axes[2, 1].legend()
 axes[2, 1].grid(True, alpha=0.3)
 

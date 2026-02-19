@@ -8,13 +8,57 @@ from Manivelles_serie_param import *
 
 t_final = 25
 f = 1.5
-amp = 5 * np.pi / 180
-theta0_sig = lambda t : amp * np.sin(2*np.pi * f * (1+0.2*np.cos(2*np.pi*0.3*f*t)) * t)
-omega0_sig = lambda t : (theta0_sig(t+1e-6) - theta0_sig(t-1e-6))/(2e-6)
+amp = 0.005 #5mm
+x0_sig = lambda t : amp * np.sin(2 * np.pi * f * (1 + 0.2 * np.cos(2 * np.pi * 0.3 * f * t)) * t)
+v0_sig = lambda t : (x0_sig(t + 1e-6) - x0_sig(t - 1e-6)) / (2e-6)
 dt = 0.001  # pas de temps
 n_steps = int(t_final / dt)
 
-t_eval = np.linspace(0, t_final, n_steps)
+
+
+
+
+# ============================================================
+# CONFIGURATION INITIALE MBS
+# ============================================================
+
+# Définir les angles initiaux (rotation autour de z)
+
+RefBody1.SetDisplacementFunction(dx_func = x0_sig)
+
+
+# ============================================================
+# SIMULATION MBS
+# ============================================================
+
+
+# Configuration de la simulation
+
+
+print(f"Configuration : dt = {dt} s, {n_steps} pas de temps")
+print("Simulation en cours...")
+
+t1 = time.time()
+t_mbs, results_mbs = mecha_sys.RunDynamicSimulation(
+    t_span=[0, t_final],
+    dt=dt,
+)
+t2 = time.time()
+print("Elapsed time: ", t2-t1)
+
+
+print("Simulation MBS terminée !")
+
+# Extraction des résultats MBS
+theta1_mbs = results_mbs['Manivelle_1'].angles[2]  # Rotation autour de z
+theta2_mbs = results_mbs['Manivelle_2'].angles[2]
+
+xm_1 = results_mbs['Manivelle_1'].displacements[0]  # Rotation autour de z
+xm_2 = results_mbs['Manivelle_2'].displacements[0]
+ym_1 = results_mbs['Manivelle_1'].displacements[1]  # Rotation autour de z
+ym_2 = results_mbs['Manivelle_2'].displacements[1]
+
+t_eval = t_mbs
 # ============================================================
 # FONCTION DE RÉSOLUTION THÉORIQUE
 # ============================================================
@@ -30,7 +74,7 @@ def system_dynamics(t, y):
     # M*θ_ddot = -C*θ_dot - K*θ
     theta_ddot = np.linalg.solve(M_theo, -C_theo @ theta_dot - K_theo @ theta)
 
-    theta_ddot[0] += (kx1*L1_b1**2 * theta0_sig(t) + cx1*L1_b1**2 * omega0_sig(t))/Jz1
+    theta_ddot[0] += -(kx1 * x0_sig(t) + cx1 * v0_sig(t)) * L1_b1 / Jz1
 
     return np.concatenate([theta_dot, theta_ddot])
 
@@ -76,47 +120,6 @@ print("Résolution théorique terminée !")
 
 
 # ============================================================
-# CONFIGURATION INITIALE MBS
-# ============================================================
-
-# Définir les angles initiaux (rotation autour de z)
-Crank1.ChangeInitialAngle([0.0, 0.0, theta1_0])
-Crank2.ChangeInitialAngle([0.0, 0.0, theta2_0])
-
-RefBody1.SetRotationFunction(dtheta_z_func = theta0_sig)
-
-
-# ============================================================
-# SIMULATION MBS
-# ============================================================
-
-
-# Configuration de la simulation
-
-
-print(f"Configuration : dt = {dt} s, {n_steps} pas de temps")
-print("Simulation en cours...")
-
-t1 = time.time()
-t_mbs, results_mbs = mecha_sys.RunDynamicSimulation(
-    t_span=[0, t_final],
-    dt=dt,
-    solver_type="constraint_stabilized",
-    stabilization_method="Lagrangian",
-    print_steps = 25,
-)
-t2 = time.time()
-print("Elapsed time: ", t2-t1)
-
-
-print("Simulation MBS terminée !")
-
-# Extraction des résultats MBS
-theta1_mbs = results_mbs['Manivelle_1'].angles[2]  # Rotation autour de z
-theta2_mbs = results_mbs['Manivelle_2'].angles[2]
-
-
-# ============================================================
 # CALCUL DES ERREURS
 # ============================================================
 
@@ -126,11 +129,9 @@ from scipy.interpolate import interp1d
 interp_theta1_theo = interp1d(sol_theo.t, theta1_theo, kind='cubic')
 interp_theta2_theo = interp1d(sol_theo.t, theta2_theo, kind='cubic')
 
-theta1_theo_interp = interp_theta1_theo(t_mbs)
-theta2_theo_interp = interp_theta2_theo(t_mbs)
 
-error_theta1 = np.abs(theta1_mbs - theta1_theo_interp)
-error_theta2 = np.abs(theta2_mbs - theta2_theo_interp)
+error_theta1 = np.abs(theta1_mbs - theta1_theo)
+error_theta2 = np.abs(theta2_mbs - theta2_theo)
 
 print("\n" + "="*60)
 print("ERREURS DE SIMULATION")
@@ -183,6 +184,30 @@ axes[1, 1].grid(True, alpha=0.3)
 plt.tight_layout()
 plt.savefig('crank_system_time_simulation.png', dpi=150)
 print("\nGraphique sauvegardé : 'crank_system_time_simulation.png'")
+
+
+
+plt.figure()
+
+plt.suptitle("Déformations des centres des pivots")
+
+plt.subplot(211)
+plt.plot(t_mbs, xm_1 * 1e6, label="Déformation X - manivelle 1")
+plt.plot(t_mbs, xm_2 * 1e6, label="Déformation X - manivelle 2")
+plt.legend()
+plt.grid()
+plt.xlabel("Temps [s]")
+plt.ylabel("X [mm]")
+
+
+plt.subplot(212)
+plt.plot(t_mbs, ym_1 * 1e6, label="Déformation Y - manivelle 1")
+plt.plot(t_mbs, ym_2 * 1e6, label="Déformation Y - manivelle 2")
+plt.legend()
+plt.xlabel("Temps [s]")
+plt.ylabel("Y [µm]")
+plt.grid()
+
 plt.show()
 
 

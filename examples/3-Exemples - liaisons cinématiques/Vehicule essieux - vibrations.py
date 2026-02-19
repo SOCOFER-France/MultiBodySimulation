@@ -16,12 +16,25 @@ fstart = 20
 fend = 100
 f2 = 200
 asd_amp = 8.74
+dt = 5e-4
 
+algo1 = "constraint_stabilized"
+algo2 = "constraint_stabilized"
 
+method1 = ""
+method2 = "Lagrangian"
+
+label1 = "BDF2 - pénalisation"
+label2 = "BDF2 - Lagrange"
+
+tol1 = 1e-9
+tol2 = 1000
+
+adaptative = False
 (mecha_sys,
  excitation_roue_11,excitation_roue_12,
  excitation_roue_21, excitation_roue_22,
- boite_11) = prepare_study(1e-6)
+ boite_11) = prepare_study(tol1)
 
 psd_func = build_PSD_61373_amplitudes(asd_amp, fstart, fend)
 spec = np.array([[f1,  psd_func(f1)],
@@ -66,9 +79,35 @@ mecha_sys.ComputeQrDecomposedSystem()
 
 t1 = time.time()
 t_eval, results = mecha_sys.RunDynamicSimulation(t_span=[0, simu_duration],
-                                                 dt=1e-3,
-                                                 solver_type="constraint_stabilized",
-                                                 stabilization_method="SmoothLagrangian",
+                                                 dt=dt,
+                                                 solver_type=algo1,
+                                                 stabilization_method=method1,
+                                                 adaptative = adaptative,
+                                                 print_steps = 10,
+                                                 print_inner_iter = False
+                                                 )
+t2 = time.time()
+print("Elapsed time: ", t2-t1)
+
+t1 = time.time()
+
+
+(mecha_sys,
+ excitation_roue_11,excitation_roue_12,
+ excitation_roue_21, excitation_roue_22,
+ boite_11) = prepare_study(tol2)
+
+excitation_roue_11.SetDisplacementFunction(dz_func = dz_func_11)
+excitation_roue_12.SetDisplacementFunction(dz_func = dz_func_12)
+excitation_roue_21.SetDisplacementFunction(dz_func = dz_func_21)
+excitation_roue_22.SetDisplacementFunction(dz_func = dz_func_22)
+
+
+t_eval_scipy, results_scipy = mecha_sys.RunDynamicSimulation(t_span=[0, simu_duration],
+                                                 dt = dt,
+                                                 solver_type = algo2,
+                                                 stabilization_method = method2,
+                                                 adaptative = False,
                                                  print_steps = 10,
                                                  print_inner_iter = False
                                 )
@@ -78,15 +117,13 @@ print("Elapsed time: ", t2-t1)
 # Extraction des résultats
 caisse_results = results["Caisse"]
 essieu_1_results = results["Essieu 1"]
-essieu_2_results = results["Essieu 2"]
 boite_11_results = results["Boite 11"]
-boite_12_results = results["Boite 12"]
-boite_21_results = results["Boite 21"]
-boite_22_results = results["Boite 22"]
-excitation_roue_11_results = results["excitation 11"]
-excitation_roue_12_results = results["excitation 12"]
-excitation_roue_21_results = results["excitation 21"]
-excitation_roue_22_results = results["excitation 22"]
+
+
+# Extraction des résultats
+caisse_results_scipy = results_scipy["Caisse"]
+essieu_1_results_scipy = results_scipy["Essieu 1"]
+boite_11_results_scipy = results_scipy["Boite 11"]
 
 # =============================================================================
 # VISUALISATIONS AMÉLIORÉES
@@ -94,47 +131,8 @@ excitation_roue_22_results = results["excitation 22"]
 
 # Configuration générale des graphiques
 plt.style.use('seaborn-v0_8-darkgrid')
-colors = {'excitation': '#FF6B6B', 'essieu': '#4ECDC4', 'boite': '#45B7D1', 'caisse': '#96CEB4'}
-
-# -------------------------------------------------------------------------
-## FIGURE 1: SIGNAUX D'EXCITATION
-# -------------------------------------------------------------------------
-fig1 = plt.figure(figsize=(10, 8))
-fig1.suptitle('Signaux d\'Excitation des 4 Roues', fontsize=16, fontweight='bold')
 
 
-excitations = {
-    'Roue 11 (AV Gauche)': excitation_roue_11_results.accelerations[2],
-    'Roue 12 (AV Droite)': excitation_roue_12_results.accelerations[2],
-    'Roue 21 (AR Gauche)': excitation_roue_21_results.accelerations[2],
-    'Roue 22 (AR Droite)': excitation_roue_22_results.accelerations[2]
-}
-
-ax1 = plt.subplot(2,1,1)
-ax2 = plt.subplot(2,1,2)
-for idx, (label, signal) in enumerate(excitations.items(), 1):
-    # Temporel
-    ax1.plot(t_eval, signal , linewidth=1.5)
-
-
-    # Fréquentiel
-    f, Pxx = compute_PSD(t_eval,signal, f1, f2)
-
-    ax2.loglog(f, Pxx, color=colors['excitation'], linewidth=1.5)
-
-ax2.plot(spec[:,0], spec[:,1], color="k", label="Spectre 61373")
-
-ax1.set_ylabel('Accélération [m/s²]', fontsize=10)
-ax1.set_title("Accélération", fontsize=11, fontweight='bold')
-ax1.grid(True, alpha=0.3)
-ax1.set_xlabel('Temps [s]', fontsize=10)
-
-ax2.set_ylabel('PSD [m²/Hz]', fontsize=10)
-ax2.set_title('Densité Spectrale de Puissance', fontsize=11)
-ax2.grid(True, alpha=0.3, which='both')
-ax2.set_xlabel('Fréquence [Hz]', fontsize=10)
-
-plt.tight_layout()
 
 # -------------------------------------------------------------------------
 # FIGURE 2: RÉPONSE DE LA CAISSE (3 AXES)
@@ -149,7 +147,9 @@ for idx in range(3):
     # Temporel
     ax1 = plt.subplot(3, 3, 3 * idx + 1)
     ax1.plot(t_eval, caisse_results.positions[idx] * 1000,
-             color=colors['caisse'], linewidth=1.5, label='Déplacement')
+             linewidth=1.0, label=f'{label1}')
+    ax1.plot(t_eval_scipy, caisse_results_scipy.positions[idx] * 1000,
+             linewidth=2.0, alpha = 0.5, label=f'{label2}')
     ax1.set_ylabel(f'Déplacement {axes_units[idx]}', fontsize=10)
     ax1.set_title(f'{axes_labels[idx]} - Temporel', fontsize=11, fontweight='bold')
     ax1.grid(True, alpha=0.3)
@@ -160,8 +160,10 @@ for idx in range(3):
 
     # Vitesse
     ax2 = plt.subplot(3, 3, 3 * idx + 2)
-    velocity = np.gradient(caisse_results.positions[idx], t_eval) * 1000
-    ax2.plot(t_eval, velocity, color='#FF8C42', linewidth=1.5)
+    velocity =caisse_results.velocities[idx] * 1000
+    velocity_scipy = caisse_results_scipy.velocities[idx] * 1000
+    ax2.plot(t_eval, velocity, label=f'{label1}', linewidth=1)
+    ax2.plot(t_eval_scipy, velocity_scipy, label=f'{label2}', linewidth=2, alpha = 0.5)
     ax2.set_ylabel(f'Vitesse [mm/s]', fontsize=10)
     ax2.set_title(f'{axes_labels[idx]} - Vitesse', fontsize=11, fontweight='bold')
     ax2.grid(True, alpha=0.3)
@@ -177,8 +179,10 @@ for idx in range(3):
 
     # Accélération
     ax3 = plt.subplot(3, 3, 3 * idx + 3)
-    acceleration = np.gradient(velocity, t_eval) / 1000  # m/s²
-    ax3.plot(t_eval, acceleration, color='#E74C3C', linewidth=1.5)
+    acceleration = caisse_results.accelerations[idx] * 1000
+    acceleration_scipy = caisse_results_scipy.accelerations[idx] * 1000
+    ax3.plot(t_eval, acceleration, linewidth=1)
+    ax3.plot(t_eval_scipy, acceleration_scipy, linewidth=2, alpha = 0.5)
     ax3.set_ylabel(f'Accélération [m/s²]', fontsize=10)
     ax3.set_title(f'{axes_labels[idx]} - Accélération', fontsize=11, fontweight='bold')
     ax3.grid(True, alpha=0.3)
@@ -207,9 +211,9 @@ axes_comp = ['X', 'Y', 'Z']
 for idx in range(3):
     ax = plt.subplot(2, 3, idx + 1)
     ax.plot(t_eval, essieu_1_boite11_results.positions[idx] * 1000,
-            color=colors['essieu'], linewidth=2, label='Essieu 1')
+            linewidth=2, label='Essieu 1')
     ax.plot(t_eval, boite_11_results.positions[idx] * 1000,
-            color=colors['boite'], linewidth=2, linestyle='--', label='Boîte 11')
+            linewidth=2, linestyle='--', label='Boîte 11')
     ax.set_ylabel(f'Position {axes_comp[idx]} [mm]', fontsize=10)
     ax.set_title(f'Axe {axes_comp[idx]} - Positions', fontsize=11, fontweight='bold')
     ax.grid(True, alpha=0.3)
@@ -235,52 +239,70 @@ for idx in range(3):
 
 plt.tight_layout()
 
-# -------------------------------------------------------------------------
-# FIGURE 4: ANALYSE SPECTRALE DE LA RÉPONSE VERTICALE
-# -------------------------------------------------------------------------
-fig4 = plt.figure(figsize=(14, 6))
-fig4.suptitle('Analyse Fréquentielle - Axe Vertical (Z)', fontsize=16, fontweight='bold')
-
-# Calcul des spectres
-f_exc, Pxx_exc = compute_PSD(t_eval, excitation_roue_11_results.accelerations[2],f1,f2)
-f_caisse, Pxx_caisse = compute_PSD(t_eval, caisse_results.accelerations[2],f1,f2)
-
-# Spectre d'excitation
-ax1 = plt.subplot(2, 1, 1)
-ax1.loglog(f_exc, Pxx_exc, color=colors['excitation'], linewidth=2, label='Excitation Roue 11')
-# Spectre de réponse
-ax1.loglog(f_caisse, Pxx_caisse, color=colors['caisse'], linewidth=2, label='Réponse Caisse')
-
-ax1.set_xlabel('Fréquence [Hz]', fontsize=11)
-ax1.set_ylabel('ASD [(m/s²)²/Hz]', fontsize=11)
-ax1.grid(True, alpha=0.3, which='both')
-ax1.legend(fontsize=9)
 
 
+fig4 = plt.figure(figsize=(14, 8))
+fig4.suptitle('Liaison Cinématique Essieu 1 - Boîte 11 - SciPy', fontsize=16, fontweight='bold')
 
-# Fonction de transfert (approximation)
-ax3 = plt.subplot(2, 1, 2)
-# Interpolation pour avoir les mêmes fréquences
-f_common = f_exc
-Pxx_caisse_interp = np.interp(f_common, f_caisse, Pxx_caisse)
-FRF = np.sqrt(Pxx_caisse_interp / (Pxx_exc + 1e-20))  # Éviter division par zéro
+essieu_1_boite11_results_scipy = essieu_1_results_scipy.get_connected_point_motion(
+    boite_11.GetReferencePosition(), approx_rotation=True)
 
-ax3.loglog(f_common, FRF, color='#9B59B6', linewidth=2)
-ax3.set_xlabel('Fréquence [Hz]', fontsize=11)
-ax3.set_ylabel('Transmissibilité [-]', fontsize=11)
-ax3.set_title('Fonction de Transfert Approx.', fontsize=12, fontweight='bold')
-ax3.grid(True, alpha=0.3, which='both')
-ax3.axhline(1, color='gray', linestyle='--', alpha=0.5, label='Unité')
-ax3.legend(fontsize=9)
+axes_comp = ['X', 'Y', 'Z']
+for idx in range(3):
+    ax = plt.subplot(2, 3, idx + 1)
+    ax.plot(t_eval_scipy, essieu_1_boite11_results_scipy.positions[idx] * 1000,
+            linewidth=2, label='Essieu 1')
+    ax.plot(t_eval_scipy, boite_11_results_scipy.positions[idx] * 1000,
+            linewidth=2, linestyle='--', label='Boîte 11')
+    ax.set_ylabel(f'Position {axes_comp[idx]} [mm]', fontsize=10)
+    ax.set_title(f'Axe {axes_comp[idx]} - Positions', fontsize=11, fontweight='bold')
+    ax.grid(True, alpha=0.3)
+    ax.legend(fontsize=9)
+
+    if idx == 0:
+        ax.set_xlabel('Temps [s]', fontsize=10)
+
+    # Écart (erreur cinématique)
+    ax2 = plt.subplot(2, 3, idx + 4)
+    error = (essieu_1_boite11_results_scipy.positions[idx] - boite_11_results_scipy.positions[idx]) * 1e6
+    ax2.plot(t_eval_scipy, error, color='#E74C3C', linewidth=1.5)
+    ax2.set_ylabel(f'Écart [µm]', fontsize=10)
+    ax2.set_title(f'Axe {axes_comp[idx]} - Écart Cinématique', fontsize=11, fontweight='bold')
+    ax2.grid(True, alpha=0.3)
+    ax2.set_xlabel('Temps [s]', fontsize=10)
+
+    max_error = np.max(np.abs(error))
+    ax2.text(0.02, 0.98, f'Max = {max_error:.2f} µm',
+             transform=ax2.transAxes, fontsize=9,
+             verticalalignment='top',
+             bbox=dict(boxstyle='round', facecolor='pink', alpha=0.5))
 
 plt.tight_layout()
 
 
-print("\n=== SIMULATION TERMINÉE ===")
-print(f"Durée simulée : {simu_duration} s")
-print(f"Nombre de points : {len(t_eval)}")
-print(
-    f"\nAccélération RMS caisse (Z) : {np.sqrt(np.mean((np.gradient(np.gradient(caisse_results.positions[2] * 1000, t_eval), t_eval) / 1000) ** 2)):.3f} m/s²")
-print(f"Cible RMS : {asd_amp:.2f} m/s²")
+plt.figure()
+
+error_thetax = (essieu_1_boite11_results.angles[0] - boite_11_results.angles[0])
+error_thetaz = (essieu_1_boite11_results.angles[2] - boite_11_results.angles[2])
+error_thetax_scipy = (essieu_1_boite11_results_scipy.angles[0] - boite_11_results_scipy.angles[0])
+error_thetaz_scipy = (essieu_1_boite11_results_scipy.angles[2] - boite_11_results_scipy.angles[2])
+
+plt.subplot(211)
+plt.title(label1)
+plt.plot(t_eval, error_thetax, color='b', linewidth=1.5, label = "Erreur angle X")
+plt.plot(t_eval, error_thetax, color="r", linewidth=1.5, label = "Erreur angle Z")
+plt.grid()
+plt.xlabel("Temps [s]")
+plt.ylabel("Angles [rad]")
+plt.legend()
+
+plt.subplot(212)
+plt.title(label2)
+plt.plot(t_eval_scipy, error_thetax_scipy, color='b', linewidth=1.5, label = "Erreur angle X")
+plt.plot(t_eval_scipy, error_thetaz_scipy, color="r", linewidth=1.5, label = "Erreur angle Z")
+plt.grid()
+plt.xlabel("Temps [s]")
+plt.ylabel("Angles [rad]")
+plt.legend()
 
 plt.show()

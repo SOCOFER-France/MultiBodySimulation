@@ -28,7 +28,7 @@ d12 = 0.30  # [m]
 Jz1 = 0.10  # Moment d'inertie manivelle 1 [kg.m²]
 Jz2 = 0.14  # Moment d'inertie manivelle 2 [kg.m²]
 mass1 = 2.0  # Masse manivelle 1 [kg]
-mass2 = 3.0  # Masse manivelle 2 [kg]
+mass2 = mass1*Jz2/Jz1  # Masse manivelle 2 [kg]
 
 # Raideurs des ressorts
 kx1 = 100.0  # Raideur ressort manivelle 1 - référence [N/m]
