@@ -15,7 +15,7 @@ except :
     print("Intsall PyPardiso")
 
 
-from MultiBodySimulation.MBSSimulationResults import MBSBodySimulationResult
+from MultiBodySimulation.MBSSimulationResults import MBSBodySimulationResult, MBSLinkPostProcessResults
 
 class MBSDynamicSolver:
     """
@@ -202,7 +202,8 @@ class MBSDynamicSolver:
 
     def _build_results_dict(self, t_eval: np.ndarray,
                             Dy: np.ndarray, y: np.ndarray,
-                            Dyfixed: np.ndarray, yfixed: np.ndarray) -> dict:
+                            Dyfixed: np.ndarray,
+                            yfixed: np.ndarray) -> dict:
         """Construit le dictionnaire de résultats par corps"""
         results = {}
 
@@ -227,6 +228,45 @@ class MBSDynamicSolver:
             results[body.GetName] = MBSBodySimulationResult(
                 body, t_eval, Dy_body, y_body, v_body
             )
+
+        results_links = {}
+        if len(self.system.links_names) > 0:
+
+            link_slice = {}
+            for id_link, link in enumerate(self.system.links) :
+                if link._postproc == False : continue
+                link_result = MBSLinkPostProcessResults(t_eval, link)
+
+                results_links[link._postproc_name] = link_result
+
+                link_slice[link._postproc_name] = slice(id_link * 6, id_link * 6 + 6)
+
+
+            nt = len(t_eval)
+            for i in range(nt):
+                du = (self.system._Qmat_linkage[:, self.system._freedof] @ Dy[:6 * self.system._nbodies, i] +
+                           self.system._Qmat_linkage[:, self.system._fixeddof] @ Dyfixed[:6 * self.system._nrefbodies, i])
+                dv = (self.system._Qmat_linkage[:, self.system._freedof] @ Dy[6 * self.system._nbodies:, i] +
+                       self.system._Qmat_linkage[:, self.system._fixeddof] @ Dyfixed[6 * self.system._nrefbodies:, i])
+
+                for name, link_result in results_links.items():
+
+                    link = link_result.linkage
+                    s = link_slice[name]
+
+                    if link._postproc_compute_deformations :
+                        link_result.deformations[:, i] = du[s][:3]
+                        link_result.angle_deformations[:, i] = du[s][3:]
+                    if link._postproc_compute_speed_deformations :
+                        link_result.deformation_speeds[:, i] = dv[s][:3]
+                        link_result.angle_deformation_speeds[:, i] = dv[s][3:]
+                    if link._postproc_compute_reactions :
+                        forces, torques = link.GetNonLinearLocalReactions(dUlocal = du[s],
+                                                                          dVlocal = dv[s],)
+                        link_result.reaction_forces[:, i] = forces
+                        link_result.reaction_torques[:, i] = torques
+            results["Linkage"] = results_links
+
 
         return results
 

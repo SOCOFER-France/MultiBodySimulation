@@ -97,6 +97,8 @@ class _MBSLink3D:
 
         self._TransGap_vector = None
         self._RotGap_vector = None
+        self.init_postproc()
+
 
     @property
     def GetBody1(self):
@@ -238,7 +240,8 @@ class _MBSLink3D:
         else :
             raise ValueError(error_mess)
 
-    def GetLinearLocalReactions(self, U1, V1, U2, V2):
+    def GetLinearLocalReactions(self, U1= None, V1= None, U2= None, V2= None,
+                                dUlocal = None, dVlocal = None):
         """Calcule les efforts locaux linéaires (force et couple) de la liaison.
 
         Les vecteurs d'état suivent la convention : les trois premières composantes
@@ -252,10 +255,28 @@ class _MBSLink3D:
         :rtype: (numpy.ndarray, numpy.ndarray)
         """
 
-        dp = U2[:3] - U1[:3]
-        dv = V2[:3] - V1[:3]
-        angle_axis = U2[3:] - U1[3:]
-        omega_rel = V2[3:] - V1[3:]
+        local_disp = True
+        if U1 is None or U2 is None or V1 is None or V1 is None:
+            local_disp = False
+        local_deflection = True
+        if dUlocal is None or dVlocal is None:
+            local_deflection = False
+
+        if (local_disp and local_deflection) or not (local_disp or local_deflection):
+            raise ValueError("Parameter error")
+
+        if local_disp :
+            dp = U2[:3] - U1[:3]
+            dv = V2[:3] - V1[:3]
+            angle_axis = U2[3:] - U1[3:]
+            omega_rel = V2[3:] - V1[3:]
+        elif local_deflection :
+            dp = dUlocal[:3]
+            dv = dVlocal[:3]
+            angle_axis = dUlocal[:3]
+            omega_rel = dVlocal[3:]
+        else :
+            raise ValueError("Parameter error")
 
         # Force de ressort + amortisseur
         if self._K is not None or self._C is not None:
@@ -285,6 +306,28 @@ class _MBSLink3D:
         """
 
         return np.zeros(3), np.zeros(3)
+
+
+    def SetPostProcess(self, link_name: str,
+                       compute_deformations : bool = True,
+                       compute_speed_deformations : bool = True,
+                       compute_reactions : bool = True):
+        if not (compute_deformations or compute_speed_deformations or compute_reactions):
+            return
+        self._postproc = True
+        self._postproc_index = None
+        self._postproc_name = link_name
+        self._postproc_compute_deformations = compute_deformations
+        self._postproc_compute_speed_deformations = compute_speed_deformations
+        self._postproc_compute_reactions = compute_reactions
+
+    def init_postproc(self):
+        self._postproc = False
+        self._postproc_index = None
+        self._postproc_name = None
+        self._postproc_compute_deformations = False
+        self._postproc_compute_speed_deformations = False
+        self._postproc_compute_reactions = False
 
 
 class MBSLinkLinearSpringDamper(_MBSLink3D) :
@@ -723,7 +766,8 @@ class MBSLinkHardStop(_MBSLink3D) :
         self._TransGap_vector = np.array([Tx_gap, Ty_gap, Tz_gap])
         self._RotGap_vector = np.array([Rx_gap, Ry_gap, Rz_gap])
 
-    def GetLinearLocalReactions(self, U1, V1, U2, V2):
+    def GetLinearLocalReactions(self, U1= None, V1= None, U2= None, V2= None,
+                                dUlocal = None, dVlocal = None):
         """Calcule la force et le couple de contact pour la butée dure.
 
         Ne génère des efforts que lorsque la déformation dépasse les limites
@@ -738,10 +782,28 @@ class MBSLinkHardStop(_MBSLink3D) :
         :rtype: (numpy.ndarray, numpy.ndarray)
         """
 
-        dp = U2[:3] - U1[:3]
-        dv = V2[:3] - V1[:3]
-        angle_axis = U2[3:] - U1[3:]
-        omega_rel = V2[3:] - V1[3:]
+        local_disp = True
+        if U1 is None or U2 is None or V1 is None or V1 is None:
+            local_disp = False
+        local_deflection = True
+        if dUlocal is None or dVlocal is None:
+            local_deflection = False
+
+        if (local_disp and local_deflection) or not (local_disp or local_deflection):
+            raise ValueError("Parameter error")
+
+        if local_disp:
+            dp = U2[:3] - U1[:3]
+            dv = V2[:3] - V1[:3]
+            angle_axis = U2[3:] - U1[3:]
+            omega_rel = V2[3:] - V1[3:]
+        elif local_deflection:
+            dp = dUlocal[:3]
+            dv = dVlocal[:3]
+            angle_axis = dUlocal[:3]
+            omega_rel = dVlocal[3:]
+        else:
+            raise ValueError("Parameter error")
 
         du_minus = self._TransGap_vector[:, 0]
         du_plus = self._TransGap_vector[:, 1]
@@ -855,7 +917,8 @@ class MBSLinkSmoothLinearStop(_MBSLink3D) :
         self._K_theta = np.diag([Rx, Ry, Rz]) * self._K_theta
         self._C_theta = np.diag([Rx, Ry, Rz]) * self._C_theta
 
-    def GetLinearLocalReactions(self, U1, V1, U2, V2):
+    def GetLinearLocalReactions(self, U1= None, V1= None, U2= None, V2= None,
+                                dUlocal = None, dVlocal = None):
         """Calcule les réactions (force, couple) pour la butée lisse.
 
         Les calculs sont analogues à ceux de :class:`MBSLinkHardStop` mais
@@ -870,10 +933,28 @@ class MBSLinkSmoothLinearStop(_MBSLink3D) :
         :rtype: (numpy.ndarray, numpy.ndarray)
         """
 
-        dp = U2[:3] - U1[:3]
-        dv = V2[:3] - V1[:3]
-        angle_axis = U2[3:] - U1[3:]
-        omega_rel = V2[3:] - V1[3:]
+        local_disp = True
+        if U1 is None or U2 is None or V1 is None or V1 is None:
+            local_disp = False
+        local_deflection = True
+        if dUlocal is None or dVlocal is None:
+            local_deflection = False
+
+        if (local_disp and local_deflection) or not (local_disp or local_deflection):
+            raise ValueError("Parameter error")
+
+        if local_disp:
+            dp = U2[:3] - U1[:3]
+            dv = V2[:3] - V1[:3]
+            angle_axis = U2[3:] - U1[3:]
+            omega_rel = V2[3:] - V1[3:]
+        elif local_deflection:
+            dp = dUlocal[:3]
+            dv = dVlocal[:3]
+            angle_axis = dUlocal[:3]
+            omega_rel = dVlocal[3:]
+        else:
+            raise ValueError("Parameter error")
 
         du_minus = self._TransGap_vector[:, 0]
         du_plus = self._TransGap_vector[:, 1]

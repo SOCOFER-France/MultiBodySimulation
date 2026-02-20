@@ -47,6 +47,8 @@ class MBSRigidBody3D:
     
     def __init__(self, name : str, mass : float, inertia_tensor : float | np.ndarray):
         self._name = name
+        if name == "Linkage" :
+            raise ValueError("Name 'Linkage' is not allowed for bodies")
         self._mass = mass
 
         self._is_fixed = False

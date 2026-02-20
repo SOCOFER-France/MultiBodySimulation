@@ -73,8 +73,21 @@ class MBSDistantPointMotionResults :
         self.time_eval = time_eval
         self.positions = positions
         self.velocities = velocities
-        self.accelerations = accelerations
+        self.angle_displacements = accelerations
         self.angles = angles
+
+class MBSLinkPostProcessResults :
+    def __init__(self, time_eval, linkage):
+        self.linkage = linkage
+        self.time_eval = time_eval
+        nt = len(time_eval)
+
+        self.deformations = np.zeros((3, nt))
+        self.deformation_speeds = np.zeros((3, nt))
+        self.angle_deformations = np.zeros((3, nt))
+        self.angle_deformation_speeds = np.zeros((3, nt))
+        self.reaction_forces = np.zeros((3, nt))
+        self.reaction_torques = np.zeros((3, nt))
 
 
 class MBSModalResults :
